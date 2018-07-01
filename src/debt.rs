@@ -43,8 +43,18 @@ const ALLOCATING_HEAD: usize = 3;
 
 static HEAD: AtomicUsize = AtomicUsize::new(NO_HEAD);
 
+struct ThreadHint(Cell<Option<&'static Entry>>);
+
+impl Drop for ThreadHint {
+    fn drop(&mut self) {
+        if let Some(entry) = self.0.get() {
+            assert!(entry.owned.swap(false, Ordering::Relaxed));
+        }
+    }
+}
+
 thread_local! {
-static THREAD_HINT: Cell<Option<&'static Entry>> = Cell::new(None);
+static THREAD_HINT: ThreadHint = ThreadHint(Cell::new(None));
 }
 
 // TODO: Something about reserves?
@@ -132,7 +142,7 @@ fn link_entry(
     new.owned.store(true, Ordering::Relaxed);
     new.next.store(next, Ordering::Relaxed);
     let new = Box::into_raw(new);
-    THREAD_HINT.with(|h| h.set(Some(unsafe { new.as_ref().unwrap() })));
+    THREAD_HINT.with(|h| h.0.set(Some(unsafe { new.as_ref().unwrap() })));
     // TODO: Could we use compare_exchange_Weak? Could that be failing forever?
     while let Err(orig) = current
         .next
@@ -151,7 +161,7 @@ fn get_head(alloc_mode: AllocMode) -> *const Entry {
 
     // This'll actually be the most common thing, hopefully and it doesn't touch anything
     // atomic.
-    let local = THREAD_HINT.with(|h| h.get());
+    let local = THREAD_HINT.with(|h| h.0.get());
     if let Some(local) = local {
         return local;
     }
@@ -166,7 +176,7 @@ fn get_head(alloc_mode: AllocMode) -> *const Entry {
             .owned
             .compare_and_swap(false, true, Ordering::Relaxed)
         {
-            THREAD_HINT.with(|h| h.set(Some(current)));
+            THREAD_HINT.with(|h| h.0.set(Some(current)));
             HEAD.store(current as *const _ as usize, Ordering::Relaxed);
             return current;
         }

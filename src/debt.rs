@@ -142,7 +142,7 @@ fn link_entry(
     new.owned.store(true, Ordering::Relaxed);
     new.next.store(next, Ordering::Relaxed);
     let new = Box::into_raw(new);
-    THREAD_HINT.with(|h| h.0.set(Some(unsafe { new.as_ref().unwrap() })));
+    let _ = THREAD_HINT.try_with(|h| h.0.set(Some(unsafe { new.as_ref().unwrap() })));
     // TODO: Could we use compare_exchange_Weak? Could that be failing forever?
     while let Err(orig) = current
         .next
@@ -154,6 +154,15 @@ fn link_entry(
     new
 }
 
+fn get_hint() -> Option<&'static Entry> {
+    THREAD_HINT
+        .try_with(|h| h.0.get())
+        .unwrap_or_else(|_| match HEAD.load(Ordering::Acquire) {
+            NO_HEAD | ALLOCATING_HEAD => None,
+            ptr => unsafe { (ptr as *const Entry).as_ref() },
+        })
+}
+
 fn get_head(alloc_mode: AllocMode) -> *const Entry {
     if alloc_mode == AllocMode::SignalSafe {
         return get_global_head(false);
@@ -161,7 +170,8 @@ fn get_head(alloc_mode: AllocMode) -> *const Entry {
 
     // This'll actually be the most common thing, hopefully and it doesn't touch anything
     // atomic.
-    let local = THREAD_HINT.with(|h| h.0.get());
+    let local = get_hint();
+
     if let Some(local) = local {
         return local;
     }
@@ -176,7 +186,7 @@ fn get_head(alloc_mode: AllocMode) -> *const Entry {
             .owned
             .compare_and_swap(false, true, Ordering::Relaxed)
         {
-            THREAD_HINT.with(|h| h.0.set(Some(current)));
+            let _ = THREAD_HINT.try_with(|h| h.0.set(Some(current)));
             HEAD.store(current as *const _ as usize, Ordering::Relaxed);
             return current;
         }

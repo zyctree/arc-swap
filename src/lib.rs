@@ -106,6 +106,8 @@ use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+mod debt;
+
 // # Implementation details
 //
 // The first idea would be to just use AtomicPtr with whatever the Arc::into_raw returns. Then

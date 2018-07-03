@@ -99,6 +99,8 @@
 //! [`Mutex`]: https://doc.rust-lang.org/std/sync/struct.Mutex.html
 //! [`shared_ptr`]: http://en.cppreference.com/w/cpp/memory/shared_ptr
 
+mod debt;
+
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::marker::PhantomData;
 use std::mem;
@@ -106,7 +108,7 @@ use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-mod debt;
+use debt::{AllocMode, Debt};
 
 // # Implementation details
 //
@@ -301,12 +303,18 @@ impl<T> ArcSwap<T> {
     #[inline]
     pub fn load(&self) -> Arc<T> {
         let gen = self.gen_lock();
+        let mut debt = Debt::confirmed(AllocMode::Allowed, || self.ptr.load(Ordering::Relaxed) as usize);
         // Acquire, to get the target of the pointer.
-        let ptr = self.ptr.load(Ordering::Acquire);
+        let ptr = debt.ptr() as *const T;
         let arc = unsafe { Arc::from_raw(ptr) };
         // Bump the reference count by one, so we can return one into the arc and another to
         // the caller.
-        Arc::into_raw(Arc::clone(&arc));
+        if debt.active() {
+            Arc::into_raw(Arc::clone(&arc));
+            if !debt.pay() {
+                drop(unsafe { Arc::from_raw(ptr) });
+            }
+        }
         // Release, so the dangerous section stays in.
         self.gen_unlock(gen);
         arc

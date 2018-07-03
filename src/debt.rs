@@ -184,10 +184,11 @@ fn get_head(alloc_mode: AllocMode) -> &'static Node {
 pub(crate) struct Debt {
     ptr: usize,
     slot: &'static AtomicUsize,
+    active: bool,
 }
 
 impl Debt {
-    pub(crate) fn new(ptr: usize, alloc_mode: AllocMode) -> Debt {
+    fn new(ptr: usize, alloc_mode: AllocMode) -> Debt {
         let head = get_head(alloc_mode);
         let mut it = 0usize;
         loop {
@@ -197,12 +198,13 @@ impl Debt {
                     return None;
                 }
                 node.slots.iter().find(|slot| {
-                    slot.compare_and_swap(EMPTY_SLOT, ptr, Ordering::Relaxed) == EMPTY_SLOT
+                    slot.compare_exchange(EMPTY_SLOT, ptr, Ordering::SeqCst, Ordering::Relaxed)
+                        .is_ok()
                 })
             });
 
             let prev = match found {
-                Ok(slot) => return Debt { ptr, slot },
+                Ok(slot) => return Debt { ptr, slot, active: true },
                 Err(prev) => prev,
             };
 
@@ -221,17 +223,52 @@ impl Debt {
         }
     }
 
-    pub(crate) fn replace(&mut self, ptr: usize) -> bool {
-        if self.slot.compare_and_swap(self.ptr, ptr, Ordering::Relaxed) == self.ptr {
+    fn replace(&mut self, ptr: usize) -> bool {
+        assert!(self.active);
+        if self.slot.compare_exchange(self.ptr, ptr, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
             self.ptr = ptr;
             true
         } else {
+            self.active = false;
             false
         }
     }
 
-    pub(crate) fn pay(mut self) -> bool {
-        self.replace(EMPTY_SLOT)
+    pub(crate) fn confirmed<F: Fn() -> usize>(alloc_mode: AllocMode, read_ptr: F) -> Debt {
+        let mut ptr = read_ptr();
+        let mut debt = Debt::new(ptr, alloc_mode);
+
+        loop {
+            let current = read_ptr();
+            if ptr == current {
+                return debt;
+            }
+            if !debt.replace(current) {
+                return debt;
+            }
+            ptr = current;
+        }
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        self.active
+    }
+
+    pub(crate) fn ptr(&self) -> usize {
+        self.ptr
+    }
+
+    pub(crate) fn pay(&mut self) -> bool {
+        assert!(self.active);
+        let result = self.replace(EMPTY_SLOT);
+        self.active = false;
+        result
+    }
+}
+
+impl Drop for Debt {
+    fn drop(&mut self) {
+        assert!(!self.active);
     }
 }
 
@@ -291,11 +328,11 @@ mod tests {
 
     #[test]
     fn get_debt() {
-        let debt_1 = Debt::new(TEST_PTR_1, AllocMode::Allowed);
+        let mut debt_1 = Debt::new(TEST_PTR_1, AllocMode::Allowed);
         assert_eq!(debt_1.ptr, TEST_PTR_1);
         assert_eq!(debt_1.slot.load(Ordering::Relaxed), TEST_PTR_1);
 
-        let debt_2 = Debt::new(TEST_PTR_1, AllocMode::SignalSafe);
+        let mut debt_2 = Debt::new(TEST_PTR_1, AllocMode::SignalSafe);
         assert_eq!(debt_2.ptr, TEST_PTR_1);
         assert_eq!(debt_2.slot.load(Ordering::Relaxed), TEST_PTR_1);
 
@@ -317,9 +354,9 @@ mod tests {
             // too many and it can't allocate.
             for _ in 0..PAR * 4 * SLOT_CNT {
                 scope.spawn(|| {
-                    let debt = Debt::new(TEST_PTR_2, AllocMode::Disallowed);
+                    let mut debt = Debt::new(TEST_PTR_2, AllocMode::Disallowed);
                     ::std::thread::yield_now();
-                    debt.pay();
+                    assert!(debt.pay());
                 });
             }
         });

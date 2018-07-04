@@ -103,8 +103,8 @@ mod debt;
 
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::ops::Deref;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -444,7 +444,12 @@ impl<T> ArcSwap<T> {
     /// [`swap`](#method.swap), otherwise it acts like [`load`](#method.load) (including the
     /// limitations).
     #[inline]
-    pub fn compare_and_swap(&self, current: Arc<T>, new: Arc<T>, alloc_mode: AllocMode) -> (bool, Arc<T>) {
+    pub fn compare_and_swap(
+        &self,
+        current: Arc<T>,
+        new: Arc<T>,
+        alloc_mode: AllocMode,
+    ) -> (bool, Arc<T>) {
         // As noted above, this method has either semantics of load or of store. We don't know
         // which ones upfront, so we need to implement safety measures for both.
         let current = strip(current);
@@ -459,7 +464,7 @@ impl<T> ArcSwap<T> {
 
             if swapped {
                 // New went into us, so leave it at that
-                return (true, Self::extract(previous))
+                return (true, Self::extract(previous));
             } else {
                 let mut debt = Debt::new(previous as usize, alloc_mode);
                 let mut previous = previous;
@@ -792,7 +797,8 @@ mod tests {
             assert_eq!(2, Arc::strong_count(&orig));
             let n1 = Arc::new(i + 1);
             // Success
-            let (swapped, prev) = shared.compare_and_swap(Arc::clone(&orig), Arc::clone(&n1), AllocMode::Allowed);
+            let (swapped, prev) =
+                shared.compare_and_swap(Arc::clone(&orig), Arc::clone(&n1), AllocMode::Allowed);
             assert!(swapped);
             assert!(Arc::ptr_eq(&orig, &prev));
             // One for orig, one for prev
@@ -803,7 +809,8 @@ mod tests {
             let n2 = Arc::new(i);
             drop(prev);
             // Failure
-            let (swapped, prev) = shared.compare_and_swap(Arc::clone(&orig), Arc::clone(&n2), AllocMode::Allowed);
+            let (swapped, prev) =
+                shared.compare_and_swap(Arc::clone(&orig), Arc::clone(&n2), AllocMode::Allowed);
             assert!(!swapped);
             assert!(Arc::ptr_eq(&n1, &prev));
             // One for orig

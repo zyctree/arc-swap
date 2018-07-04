@@ -209,7 +209,13 @@ impl Debt {
             });
 
             let prev = match found {
-                Ok(slot) => return Debt { ptr, slot, active: true },
+                Ok(slot) => {
+                    return Debt {
+                        ptr,
+                        slot,
+                        active: true,
+                    }
+                }
                 Err(prev) => prev,
             };
 
@@ -229,7 +235,12 @@ impl Debt {
     }
 
     pub(crate) fn replace(&mut self, ptr: usize) -> bool {
-        if self.active && self.slot.compare_exchange(self.ptr, ptr, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+        if self.active
+            && self
+                .slot
+                .compare_exchange(self.ptr, ptr, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+        {
             self.ptr = ptr;
             true
         } else {
@@ -271,14 +282,18 @@ impl Debt {
     // TODO: Document the pre-charge
     pub(crate) fn pay_all<P: Fn()>(ptr: usize, pay: P) {
         let head = Node::load(&HEAD);
-        assert!(traverse(head, |n| {
-            for s in &n.slots {
-                if s.compare_exchange(ptr, EMPTY_SLOT, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                    pay();
+        assert!(
+            traverse(head, |n| {
+                for s in &n.slots {
+                    if s.compare_exchange(ptr, EMPTY_SLOT, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        pay();
+                    }
                 }
-            }
-            None::<()>
-        }).is_err());
+                None::<()>
+            }).is_err()
+        );
     }
 }
 
@@ -326,7 +341,8 @@ mod tests {
         });
 
         let cnt = AtomicUsize::new(0);
-        assert!(traverse(&N1, |_| {
+        assert!(
+            traverse(&N1, |_| {
                 cnt.fetch_add(1, Ordering::Relaxed);
                 None::<()>
             }).is_err()

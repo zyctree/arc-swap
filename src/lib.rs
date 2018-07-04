@@ -232,14 +232,12 @@ impl<'a, T> Guard<'a, T> {
 
 impl<'a, T> Deref for Guard<'a, T> {
     type Target = T;
-    #[inline]
     fn deref(&self) -> &T {
         unsafe { self.ptr.as_ref().unwrap() }
     }
 }
 
 impl<'a, T> Drop for Guard<'a, T> {
-    #[inline]
     fn drop(&mut self) {
         if !self.debt.pay() {
             ArcSwap::<T>::dispose(self.ptr);
@@ -356,7 +354,6 @@ impl<T> ArcSwap<T> {
     /// thread stores into the same instance at the same time).
     ///
     /// The method is lock-free and wait-free.
-    #[inline]
     pub fn load(&self) -> Arc<T> {
         Guard::upgrade(&self.peek())
     }
@@ -377,7 +374,6 @@ impl<T> ArcSwap<T> {
     /// (reasonably small) configuration value, but not for eg. computations on the held values.
     ///
     /// If you are not sure what is better, benchmarking is recommended.
-    #[inline]
     pub fn peek(&self) -> Guard<T> {
         self.peek_with_alloc(AllocMode::Allowed)
     }
@@ -397,7 +393,6 @@ impl<T> ArcSwap<T> {
     /// Replaces the value inside this instance.
     ///
     /// Further loads will yield the new value. Uses [`swap`](#method.swap) internally.
-    #[inline]
     pub fn store(&self, arc: Arc<T>) {
         drop(self.swap(arc));
     }
@@ -418,7 +413,6 @@ impl<T> ArcSwap<T> {
     /// While multiple `swap`s can run concurrently and won't block each other, each one needs to
     /// wait for all the [`load`s](#method.load) that have seen the old value to finish before
     /// returning.
-    #[inline]
     pub fn swap(&self, arc: Arc<T>) -> Arc<T> {
         let new = strip(arc);
         // AcqRel needed to publish the target of the new pointer and get the target of the old
@@ -443,7 +437,6 @@ impl<T> ArcSwap<T> {
     /// In other words, if the caller „guesses“ the value of current correctly, it acts like
     /// [`swap`](#method.swap), otherwise it acts like [`load`](#method.load) (including the
     /// limitations).
-    #[inline]
     pub fn compare_and_swap(
         &self,
         current: Arc<T>,

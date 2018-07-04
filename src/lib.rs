@@ -103,8 +103,7 @@ mod debt;
 
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::marker::PhantomData;
-use std::mem;
-use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -186,19 +185,6 @@ use debt::{AllocMode, Debt};
 //
 // All other operations can be Relaxed.
 
-/// Generation lock, to abstract locking and unlocking readers.
-struct GenLock(usize);
-
-/// A bomb so one doesn't forget to unlock generations.
-impl Drop for GenLock {
-    fn drop(&mut self) {
-        unreachable!("Forgot to unlock generation");
-    }
-}
-
-/// Store count for 2 newest generations (others must always be 0)
-const GEN_CNT: usize = 2;
-
 /// Turn the arc into a raw pointer.
 fn strip<T>(arc: Arc<T>) -> *mut T {
     Arc::into_raw(arc) as *mut T
@@ -236,12 +222,6 @@ pub struct ArcSwap<T> {
     /// The actual pointer, extracted from the Arc.
     ptr: AtomicPtr<T>,
 
-    /// The current generation. Module by their count to discover the groups.
-    gen_idx: AtomicUsize,
-
-    /// Count of readers in either generation.
-    reader_group_cnts: [AtomicUsize; GEN_CNT],
-
     /// We are basically an Arc in disguise. Inherit parameters from Arc by pretending to contain
     /// it.
     _phantom_arc: PhantomData<Arc<T>>,
@@ -255,8 +235,6 @@ impl<T> From<Arc<T>> for ArcSwap<T> {
         let ptr = strip(arc);
         Self {
             ptr: AtomicPtr::new(ptr),
-            gen_idx: AtomicUsize::new(0),
-            reader_group_cnts: [AtomicUsize::new(0), AtomicUsize::new(0)],
             _phantom_arc: PhantomData,
         }
     }
@@ -294,6 +272,22 @@ impl<T: Display> Display for ArcSwap<T> {
 }
 
 impl<T> ArcSwap<T> {
+    fn dispose(ptr: *const T) {
+        drop(unsafe { Arc::from_raw(ptr) });
+    }
+
+    fn load_bump(ptr: *const T, mut debt: Debt) -> Arc<T> {
+        let arc = unsafe { Arc::from_raw(ptr) };
+        // Bump the reference count by one, so we can return one into the arc and another to
+        // the caller.
+        if debt.active() {
+            Arc::into_raw(Arc::clone(&arc));
+            if !debt.pay() {
+                Self::dispose(ptr);
+            }
+        }
+        arc
+    }
     /// Loads the value.
     ///
     /// This makes another copy (reference) and returns it, atomically (it is safe even when other
@@ -302,21 +296,11 @@ impl<T> ArcSwap<T> {
     /// The method is lock-free and wait-free.
     #[inline]
     pub fn load(&self) -> Arc<T> {
-        let gen = self.gen_lock();
-        let mut debt = Debt::confirmed(AllocMode::Allowed, || self.ptr.load(Ordering::Relaxed) as usize);
+        let debt = Debt::confirmed(AllocMode::Allowed, || self.ptr.load(Ordering::Relaxed) as usize);
         // Acquire, to get the target of the pointer.
         let ptr = debt.ptr() as *const T;
-        let arc = unsafe { Arc::from_raw(ptr) };
-        // Bump the reference count by one, so we can return one into the arc and another to
-        // the caller.
-        if debt.active() {
-            Arc::into_raw(Arc::clone(&arc));
-            if !debt.pay() {
-                drop(unsafe { Arc::from_raw(ptr) });
-            }
-        }
+        let arc = Self::load_bump(ptr, debt);
         // Release, so the dangerous section stays in.
-        self.gen_unlock(gen);
         arc
     }
 
@@ -326,6 +310,17 @@ impl<T> ArcSwap<T> {
     #[inline]
     pub fn store(&self, arc: Arc<T>) {
         drop(self.swap(arc));
+    }
+
+    fn extract(old: *const T) -> Arc<T> {
+        let old_ptr = old as usize;
+        let old_arc = unsafe { Arc::from_raw(old) };
+        let inc = || {
+            Arc::into_raw(Arc::clone(&old_arc));
+        };
+        inc(); // Precharge
+        Debt::pay_all(old_ptr, inc);
+        unsafe { Arc::from_raw(old) }
     }
 
     /// Exchanges the value inside this instance.
@@ -341,14 +336,7 @@ impl<T> ArcSwap<T> {
         //
         // SeqCst to synchronize the time lines with the group counters.
         let old = self.ptr.swap(new, Ordering::SeqCst);
-        let old_ptr = old as usize;
-        let old_arc = unsafe { Arc::from_raw(old) };
-        let inc = || {
-            Arc::into_raw(Arc::clone(&old_arc));
-        };
-        inc(); // Precharge
-        Debt::pay_all(old_ptr, inc);
-        unsafe { Arc::from_raw(old) }
+        Self::extract(old)
     }
 
     /// Swaps the stored Arc if it is equal to `current`.
@@ -370,85 +358,37 @@ impl<T> ArcSwap<T> {
         // As noted above, this method has either semantics of load or of store. We don't know
         // which ones upfront, so we need to implement safety measures for both.
         let current = strip(current);
+        // We get rid of current
+        // TODO: Could we use some trick to pass only reference?
+        Self::dispose(current);
         let new = strip(new);
 
-        let gen = self.gen_lock();
+        'outer: loop {
+            let previous = self.ptr.compare_and_swap(current, new, Ordering::SeqCst);
+            let swapped = current == previous;
 
-        let previous = self.ptr.compare_and_swap(current, new, Ordering::SeqCst);
-        let swapped = current == previous;
-        let previous = unsafe { Arc::from_raw(previous) };
-
-        if swapped {
-            // New went in, previous out, but their ref counts are correct. We handle current later
-            // on. So nothing to do here.
-        } else {
-            // Previous is a new copy of what is inside (and it stays there as well), so bump its
-            // ref count. New is thrown away so dec its ref count (but do it outside of the
-            // gen-lock).
-            Arc::into_raw(Arc::clone(&previous));
-        }
-
-        self.gen_unlock(gen);
-
-        if swapped {
-            // We swapped. Before releasing the (possibly only) ref count of previous to user, wait
-            // for all readers to make sure there are no more untracked copies of it.
-            self.wait_for_readers();
-        } else {
-            // We didn't swap, so new is black-holed.
-            drop(unsafe { Arc::from_raw(new) });
-        }
-        // The current is black-holed every time.
-        drop(unsafe { Arc::from_raw(current) });
-
-        (swapped, previous)
-    }
-
-    /// Wait until all readers go away.
-    #[inline]
-    fn wait_for_readers(&self) {
-        let mut seen_group = [false; GEN_CNT];
-        while !seen_group.iter().all(|seen| *seen) {
-            // Note that we don't need the snapshot to be consistent. We just need to see both
-            // halves being zero, not necessarily at the same time.
-            let gen = self.gen_idx.load(Ordering::Relaxed);
-            let groups = [
-                self.reader_group_cnts[0].load(Ordering::Acquire),
-                self.reader_group_cnts[1].load(Ordering::Acquire),
-            ];
-            // Should we increment the generation? Is the next one empty?
-            let next_gen = gen.wrapping_add(1);
-            if groups[next_gen % GEN_CNT] == 0 {
-                // Replace it only if someone else didn't do it in the meantime
-                self.gen_idx
-                    .compare_and_swap(gen, next_gen, Ordering::Relaxed);
+            if swapped {
+                // New went into us, so leave it at that
+                return (true, Self::extract(previous))
+            } else {
+                let mut debt = Debt::new(previous as usize, AllocMode::Allowed);
+                let mut previous = previous;
+                loop {
+                    let confirm = self.ptr.load(Ordering::Relaxed);
+                    if confirm == previous {
+                        Self::dispose(new);
+                        return (false, Self::load_bump(previous, debt));
+                    } else if confirm == current {
+                        continue 'outer; // TODO: Something with the debt, reuse
+                    } else if debt.replace(confirm as usize) {
+                        previous = confirm;
+                    } else {
+                        Self::dispose(new);
+                        return (false, Self::load_bump(previous, debt));
+                    }
+                }
             }
-            for i in 0..GEN_CNT {
-                seen_group[i] = seen_group[i] || (groups[i] == 0);
-            }
-            atomic::spin_loop_hint();
         }
-    }
-
-    #[inline]
-    fn gen_lock(&self) -> GenLock {
-        let gen = self.gen_idx.load(Ordering::Relaxed) % GEN_CNT;
-        // Unlike the real Arc, we don't have to check for the ref count overflow. Nobody can drop
-        // a reader.
-        //
-        // SeqCst: Acquire, so the dangerous section stays in. SeqCst to sync timelines with the
-        // swap on the ptr in writer thread.
-        self.reader_group_cnts[gen].fetch_add(1, Ordering::SeqCst);
-        GenLock(gen)
-    }
-
-    #[inline]
-    fn gen_unlock(&self, lock: GenLock) {
-        let gen = lock.0;
-        // Disarm the drop-bomb
-        mem::forget(lock);
-        // Release, so the dangerous section stays in.
-        self.reader_group_cnts[gen].fetch_sub(1, Ordering::Release);
     }
 
     /// Read-Copy-Update of the pointer inside.
@@ -631,7 +571,7 @@ impl<T> ArcSwap<T> {
 mod tests {
     extern crate crossbeam_utils;
 
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{self, AtomicUsize};
     use std::sync::Barrier;
 
     use self::crossbeam_utils::scoped as thread;

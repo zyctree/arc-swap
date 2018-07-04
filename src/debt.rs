@@ -188,7 +188,7 @@ pub(crate) struct Debt {
 }
 
 impl Debt {
-    fn new(ptr: usize, alloc_mode: AllocMode) -> Debt {
+    pub(crate) fn new(ptr: usize, alloc_mode: AllocMode) -> Debt {
         let head = get_head(alloc_mode);
         let mut it = 0usize;
         loop {
@@ -223,7 +223,7 @@ impl Debt {
         }
     }
 
-    fn replace(&mut self, ptr: usize) -> bool {
+    pub(crate) fn replace(&mut self, ptr: usize) -> bool {
         assert!(self.active);
         if self.slot.compare_exchange(self.ptr, ptr, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
             self.ptr = ptr;

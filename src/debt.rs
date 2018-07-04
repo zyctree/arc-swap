@@ -3,11 +3,16 @@ use std::ptr;
 use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::thread;
 
+/// TODO
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) enum AllocMode {
+pub enum AllocMode {
+    /// TODO
     Allowed,
+    /// TODO
     ThreadHead,
+    /// TODO
     Disallowed,
+    /// TODO
     SignalSafe,
 }
 

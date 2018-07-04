@@ -108,8 +108,11 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::thread;
 
-use debt::{AllocMode, Debt};
+pub use debt::AllocMode;
 
+use debt::Debt;
+
+// TODO: This is all wrong. And docs too.
 // # Implementation details
 //
 // The first idea would be to just use AtomicPtr with whatever the Arc::into_raw returns. Then
@@ -376,7 +379,12 @@ impl<T> ArcSwap<T> {
     /// If you are not sure what is better, benchmarking is recommended.
     #[inline]
     pub fn peek(&self) -> Guard<T> {
-        let debt = Debt::confirmed(AllocMode::Allowed, || self.ptr.load(Ordering::Relaxed) as usize);
+        self.peek_with_alloc(AllocMode::Allowed)
+    }
+
+    /// TODO
+    pub fn peek_with_alloc(&self, alloc_mode: AllocMode) -> Guard<T> {
+        let debt = Debt::confirmed(alloc_mode, || self.ptr.load(Ordering::Relaxed) as usize);
         let ptr = debt.ptr() as *const T;
 
         Guard {
@@ -436,7 +444,7 @@ impl<T> ArcSwap<T> {
     /// [`swap`](#method.swap), otherwise it acts like [`load`](#method.load) (including the
     /// limitations).
     #[inline]
-    pub fn compare_and_swap(&self, current: Arc<T>, new: Arc<T>) -> (bool, Arc<T>) {
+    pub fn compare_and_swap(&self, current: Arc<T>, new: Arc<T>, alloc_mode: AllocMode) -> (bool, Arc<T>) {
         // As noted above, this method has either semantics of load or of store. We don't know
         // which ones upfront, so we need to implement safety measures for both.
         let current = strip(current);
@@ -453,7 +461,7 @@ impl<T> ArcSwap<T> {
                 // New went into us, so leave it at that
                 return (true, Self::extract(previous))
             } else {
-                let mut debt = Debt::new(previous as usize, AllocMode::Allowed);
+                let mut debt = Debt::new(previous as usize, alloc_mode);
                 let mut previous = previous;
                 loop {
                     let confirm = self.ptr.load(Ordering::Relaxed);
@@ -600,7 +608,7 @@ impl<T> ArcSwap<T> {
         let mut cur = self.load();
         loop {
             let new = f(&cur).into();
-            let (swapped, prev) = self.compare_and_swap(cur, new);
+            let (swapped, prev) = self.compare_and_swap(cur, new, AllocMode::Allowed);
             if swapped {
                 return prev;
             } else {
@@ -784,7 +792,7 @@ mod tests {
             assert_eq!(2, Arc::strong_count(&orig));
             let n1 = Arc::new(i + 1);
             // Success
-            let (swapped, prev) = shared.compare_and_swap(Arc::clone(&orig), Arc::clone(&n1));
+            let (swapped, prev) = shared.compare_and_swap(Arc::clone(&orig), Arc::clone(&n1), AllocMode::Allowed);
             assert!(swapped);
             assert!(Arc::ptr_eq(&orig, &prev));
             // One for orig, one for prev
@@ -795,7 +803,7 @@ mod tests {
             let n2 = Arc::new(i);
             drop(prev);
             // Failure
-            let (swapped, prev) = shared.compare_and_swap(Arc::clone(&orig), Arc::clone(&n2));
+            let (swapped, prev) = shared.compare_and_swap(Arc::clone(&orig), Arc::clone(&n2), AllocMode::Allowed);
             assert!(!swapped);
             assert!(Arc::ptr_eq(&n1, &prev));
             // One for orig

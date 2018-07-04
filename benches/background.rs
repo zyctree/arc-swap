@@ -1,5 +1,6 @@
 #![feature(test)]
 
+extern crate atomic;
 extern crate arc_swap;
 extern crate crossbeam;
 extern crate crossbeam_utils;
@@ -415,4 +416,58 @@ mod arc_cell {
 
     method!(read);
     method!(write);
+}
+
+mod atomic_b {
+    use atomic::atomic_arc::AtomicArc;
+
+    lazy_static! {
+        static ref A: AtomicArc<usize> = AtomicArc::new(Arc::new(0));
+    }
+
+    fn peek() {
+        for _ in 0..ITERS {
+            test::black_box(*A.get().as_ref().unwrap());
+        }
+    }
+
+    fn lease() {
+        for _ in 0..ITERS {
+            test::black_box(A.get());
+        }
+    }
+
+    fn read() {
+        for _ in 0..ITERS {
+            test::black_box(A.get().clone_inner().unwrap());
+        }
+    }
+
+    fn write() {
+        for _ in 0..ITERS {
+            test::black_box(A.set(Arc::new(42)));
+        }
+    }
+
+    fn four_leases() {
+        for _ in 0..ITERS {
+            let l1 = A.get();
+            let l2 = A.get();
+            let l3 = A.get();
+            let l4 = A.get();
+            test::black_box((
+                *l1.as_ref().unwrap(),
+                *l2.as_ref().unwrap(),
+                *l3.as_ref().unwrap(),
+                *l4.as_ref().unwrap(),
+            ));
+        }
+    }
+
+    noise!();
+
+    method!(peek);
+    method!(read);
+    method!(write);
+    method!(four_leases);
 }

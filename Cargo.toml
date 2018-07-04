@@ -21,6 +21,7 @@ maintenance = { status = "actively-developed" }
 crossbeam-utils = "~0.4"
 lazy_static = "~1"
 version-sync = "~0.5"
+atomic = { git = "https://github.com/stjepang/atomic" }
 
 [[bench]]
 name = "atomics"

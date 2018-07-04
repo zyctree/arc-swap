@@ -1,5 +1,6 @@
 #![feature(test)]
 
+extern crate atomic;
 extern crate arc_swap;
 extern crate crossbeam_utils;
 #[macro_use]
@@ -157,6 +158,38 @@ mod rwlock {
     fn write() {
         for _ in 0..ITERS {
             test::black_box(*L.write().unwrap() = Arc::new(42));
+        }
+    }
+
+    noise!();
+
+    method!(peek);
+    method!(read);
+    method!(write);
+}
+
+mod atomic_b {
+    use atomic::atomic_arc::AtomicArc;
+
+    lazy_static! {
+        static ref A: AtomicArc<usize> = AtomicArc::new(Arc::new(0));
+    }
+
+    fn peek() {
+        for _ in 0..ITERS {
+            test::black_box(*A.get().as_ref().unwrap());
+        }
+    }
+
+    fn read() {
+        for _ in 0..ITERS {
+            test::black_box(A.get().clone_inner().unwrap());
+        }
+    }
+
+    fn write() {
+        for _ in 0..ITERS {
+            test::black_box(A.set(Arc::new(0)));
         }
     }
 

@@ -264,11 +264,18 @@ impl Debt {
         self.active = false;
         result
     }
-}
 
-impl Drop for Debt {
-    fn drop(&mut self) {
-        assert!(!self.active);
+    // TODO: Document the pre-charge
+    pub(crate) fn pay_all<P: Fn()>(ptr: usize, pay: P) {
+        let head = Node::load(&HEAD);
+        assert!(traverse(head, |n| {
+            for s in &n.slots {
+                if s.compare_exchange(ptr, EMPTY_SLOT, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    pay();
+                }
+            }
+            None::<()>
+        }).is_err());
     }
 }
 
@@ -360,5 +367,46 @@ mod tests {
                 });
             }
         });
+    }
+
+    const TEST_PTR_3: usize = 11;
+    const TEST_PTR_4: usize = 13;
+
+    #[test]
+    fn pay_all_replace() {
+        for _ in 0..1000 {
+            let mut debt_1 = Debt::new(TEST_PTR_3, AllocMode::Allowed);
+            let mut debt_2 = Debt::new(TEST_PTR_3, AllocMode::Allowed);
+            let mut debt_3 = Debt::new(TEST_PTR_3, AllocMode::Allowed);
+
+            assert_eq!(debt_1.ptr, TEST_PTR_3);
+            assert_eq!(debt_1.slot.load(Ordering::Relaxed), TEST_PTR_3);
+
+            assert_eq!(debt_2.ptr, TEST_PTR_3);
+            assert_eq!(debt_2.slot.load(Ordering::Relaxed), TEST_PTR_3);
+
+            assert_eq!(debt_3.ptr, TEST_PTR_3);
+            assert_eq!(debt_3.slot.load(Ordering::Relaxed), TEST_PTR_3);
+
+            assert!(debt_3.replace(TEST_PTR_4));
+
+            assert_eq!(debt_3.ptr, TEST_PTR_4);
+            assert_eq!(debt_3.slot.load(Ordering::Relaxed), TEST_PTR_4);
+
+            let cnt = AtomicUsize::new(0);
+            Debt::pay_all(TEST_PTR_3, || {
+                cnt.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(2, cnt.load(Ordering::Relaxed));
+
+            assert!(!debt_1.replace(TEST_PTR_4));
+            assert_eq!(debt_1.ptr, TEST_PTR_3);
+            assert!(!debt_1.active);
+            // We can't really do this, other test might have used that slot already!
+            // assert_eq!(debt_1.slot.load(Ordering::Relaxed), EMPTY_SLOT);
+
+            assert!(!debt_2.pay());
+            assert!(debt_3.pay());
+        }
     }
 }

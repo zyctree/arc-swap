@@ -341,7 +341,13 @@ impl<T> ArcSwap<T> {
         //
         // SeqCst to synchronize the time lines with the group counters.
         let old = self.ptr.swap(new, Ordering::SeqCst);
-        self.wait_for_readers();
+        let old_ptr = old as usize;
+        let old_arc = unsafe { Arc::from_raw(old) };
+        let inc = || {
+            Arc::into_raw(Arc::clone(&old_arc));
+        };
+        inc(); // Precharge
+        Debt::pay_all(old_ptr, inc);
         unsafe { Arc::from_raw(old) }
     }
 

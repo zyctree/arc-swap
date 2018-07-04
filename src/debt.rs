@@ -224,8 +224,7 @@ impl Debt {
     }
 
     pub(crate) fn replace(&mut self, ptr: usize) -> bool {
-        assert!(self.active);
-        if self.slot.compare_exchange(self.ptr, ptr, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+        if self.active && self.slot.compare_exchange(self.ptr, ptr, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
             self.ptr = ptr;
             true
         } else {
@@ -259,7 +258,6 @@ impl Debt {
     }
 
     pub(crate) fn pay(&mut self) -> bool {
-        assert!(self.active);
         let result = self.replace(EMPTY_SLOT);
         self.active = false;
         result

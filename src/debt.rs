@@ -394,6 +394,20 @@ mod tests {
     #[test]
     fn pay_all_replace() {
         for _ in 0..1000 {
+            let cnt = AtomicUsize::new(0);
+            let count_ptr_3 = || {
+                let _ = traverse(Node::load(&HEAD), |n| {
+                    for slot in &n.slots {
+                        if slot.load(Ordering::Relaxed) == TEST_PTR_3 {
+                            cnt.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    None::<()>
+                });
+            };
+            count_ptr_3();
+            assert_eq!(0, cnt.swap(0, Ordering::Relaxed));
+
             let mut debt_1 = Debt::new(TEST_PTR_3, AllocMode::Allowed);
             let mut debt_2 = Debt::new(TEST_PTR_3, AllocMode::Allowed);
             let mut debt_3 = Debt::new(TEST_PTR_3, AllocMode::Allowed);
@@ -407,12 +421,17 @@ mod tests {
             assert_eq!(debt_3.ptr, TEST_PTR_3);
             assert_eq!(debt_3.slot.load(Ordering::Relaxed), TEST_PTR_3);
 
+            count_ptr_3();
+            assert_eq!(3, cnt.swap(0, Ordering::Relaxed));
+
             assert!(debt_3.replace(TEST_PTR_4));
 
             assert_eq!(debt_3.ptr, TEST_PTR_4);
             assert_eq!(debt_3.slot.load(Ordering::Relaxed), TEST_PTR_4);
 
-            let cnt = AtomicUsize::new(0);
+            count_ptr_3();
+            assert_eq!(2, cnt.swap(0, Ordering::Relaxed));
+
             Debt::pay_all(TEST_PTR_3, || {
                 cnt.fetch_add(1, Ordering::Relaxed);
             });

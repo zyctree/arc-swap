@@ -164,7 +164,10 @@ fn get_head(alloc_mode: AllocMode) -> &'static Node {
             HEAD.store(node.ptr(), Ordering::Relaxed);
             // Also update our thread hint once we claimed it (and ignore errors if we are shutting
             // down the thread)
-            let _ = THREAD_HINT.try_with(|h| h.0.set(Some(node)));
+            if THREAD_HINT.try_with(|h| h.0.set(Some(node))).is_err() {
+                // In case the thread is already dying, we need to not claim the ownership
+                node.owned.store(false, Ordering::Relaxed);
+            }
             return node;
         }
         Err(prev) => prev,
@@ -175,7 +178,10 @@ fn get_head(alloc_mode: AllocMode) -> &'static Node {
         let new = Node::link_new(prev, head, EMPTY_SLOT, true);
         // Now we've created the new node, we already own it, so we link it into the thread local
         // hint.
-        let _ = THREAD_HINT.try_with(|h| h.0.set(Some(new)));
+        if THREAD_HINT.try_with(|h| h.0.set(Some(new))).is_err() {
+            // In case the thread is already dying, we need to not claim the ownership
+            new.owned.store(false, Ordering::Relaxed);
+        }
         new
     } else {
         // We can't allocate. So we'll have to use what's there' already and it doesn't really

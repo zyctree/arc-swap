@@ -394,13 +394,13 @@ mod tests {
 
     #[test]
     fn pay_all_replace() {
-        for _ in 0..1000 {
+        for i in 0..1000 {
             let cnt = AtomicUsize::new(0);
             let count_ptr_3 = || {
                 let _ = traverse(Node::load(&HEAD), |n| {
                     for slot in &n.slots {
                         let val = slot.load(Ordering::Relaxed);
-                        println!("Node {:p} slot {:p} = {:X}", n, slot, val);
+                        println!("{:4}: Node {:p} slot {:p} = {:X}", i, n, slot, val);
                         if val == TEST_PTR_3 {
                             cnt.fetch_add(1, Ordering::Relaxed);
                         }
@@ -439,7 +439,9 @@ mod tests {
                 println!("Pay!");
                 cnt.fetch_add(1, Ordering::Relaxed);
             });
-            assert_eq!(2, cnt.load(Ordering::Relaxed));
+            assert_eq!(2, cnt.swap(0, Ordering::Relaxed));
+            count_ptr_3();
+            assert_eq!(0, cnt.swap(0, Ordering::Relaxed));
 
             assert!(!debt_1.replace(TEST_PTR_4));
             assert_eq!(debt_1.ptr, TEST_PTR_3);

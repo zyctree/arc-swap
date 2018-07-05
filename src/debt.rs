@@ -50,7 +50,7 @@ impl Node {
 
         let new = Box::leak(Box::new(new));
 
-        while let Err(next) = prev.next.compare_exchange_weak(
+        while let Err(next) = prev.next.compare_exchange(
             current.ptr(),
             new.ptr(),
             Ordering::Release,
@@ -203,12 +203,13 @@ impl Debt {
                     // Only signals are allowed into the reserve.
                     return None;
                 }
-                node.slots.iter().find(|slot| {
-                    let res = slot.compare_exchange(EMPTY_SLOT, ptr, Ordering::SeqCst, Ordering::Relaxed)
-                        .is_ok();
-                    println!("Tried slot {:p}: {}", slot, res);
-                    res
-                })
+                for s in &node.slots {
+                    if s.compare_and_swap(EMPTY_SLOT, ptr, Ordering::SeqCst) == EMPTY_SLOT {
+                        println!("Allocated slot {:p} for {:x}", s, ptr);
+                        return Some(s);
+                    }
+                }
+                None
             });
 
             let prev = match found {
@@ -238,12 +239,7 @@ impl Debt {
     }
 
     pub(crate) fn replace(&mut self, ptr: usize) -> bool {
-        if self.active
-            && self
-                .slot
-                .compare_exchange(self.ptr, ptr, Ordering::SeqCst, Ordering::Relaxed)
-                .is_ok()
-        {
+        if self.active && self.slot.compare_and_swap(self.ptr, ptr, Ordering::SeqCst) == self.ptr {
             self.ptr = ptr;
             true
         } else {
@@ -288,9 +284,7 @@ impl Debt {
         assert!(
             traverse(head, |n| {
                 for s in &n.slots {
-                    if s.compare_exchange(ptr, EMPTY_SLOT, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                    {
+                    if s.compare_and_swap(ptr, EMPTY_SLOT, Ordering::Relaxed) == ptr {
                         println!("Pay on slot {:p}", s);
                         pay();
                     }

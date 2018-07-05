@@ -190,15 +190,19 @@ use debt::Debt;
 // All other operations can be Relaxed.
 
 /// A short-term proxy object from [`peek`](struct.ArcSwap.html#method.peek)
-pub struct Guard<'a, T: 'a> {
+///
+/// # Lifetime
+///
+/// Note that the `Guard` can outlive the `ArcSwap` it comes from. This is by design. Same as it is
+/// possible to exchange the content of the `ArcSwap` with a `Guard` alive, it is possible to drop
+/// the `ArcSwap` ‒ the `Arc` itself is kept alive as long as at least one `Guard` holds it.
+pub struct Guard<T> {
     debt: Debt,
-    // TODO: We will be able to get rid of this eventually and even get rid of the lifetime. But
-    // for now, keep it here to ensure we don't outlive it as we are unable to cope with that yet.
-    _arc_swap: &'a ArcSwap<T>,
     ptr: *const T,
+    _arc: PhantomData<Arc<T>>,
 }
 
-impl<'a, T> Guard<'a, T> {
+impl<T> Guard<T> {
     /// Upgrades the guard to a real `Arc`.
     ///
     /// This shares the reference count with all the `Arc` inside the corresponding `ArcSwap`. Use
@@ -230,14 +234,14 @@ impl<'a, T> Guard<'a, T> {
     }
 }
 
-impl<'a, T> Deref for Guard<'a, T> {
+impl<T> Deref for Guard<T> {
     type Target = T;
     fn deref(&self) -> &T {
         unsafe { self.ptr.as_ref().unwrap() }
     }
 }
 
-impl<'a, T> Drop for Guard<'a, T> {
+impl<T> Drop for Guard<T> {
     fn drop(&mut self) {
         if !self.debt.pay() {
             ArcSwap::<T>::dispose(self.ptr);
@@ -302,14 +306,8 @@ impl<T> From<Arc<T>> for ArcSwap<T> {
 
 impl<T> Drop for ArcSwap<T> {
     fn drop(&mut self) {
-        // Note that by now we are visible only by one thread (otherwise we couldn't get `&mut`),
-        // so we can abandon all these atomic-ordering madnesses.
-
-        // We hold one reference in the Arc, but it's hidden. Convert us back to Arc and drop that
-        // Arc instead of us, which will clear the ref.
         let ptr = *self.ptr.get_mut();
-        // Turn it back into the Arc and then drop it.
-        drop(unsafe { Arc::from_raw(ptr) });
+        drop(Self::extract(ptr));
     }
 }
 
@@ -386,7 +384,7 @@ impl<T> ArcSwap<T> {
         Guard {
             debt,
             ptr,
-            _arc_swap: self,
+            _arc: PhantomData,
         }
     }
 
@@ -778,8 +776,8 @@ mod tests {
         });
     }
 
-    #[test]
     /// Make sure the reference count and compare_and_swap works as expected.
+    #[test]
     fn cas_ref_cnt() {
         const ITERATIONS: usize = 50;
         let shared = ArcSwap::from(Arc::new(0));
@@ -816,8 +814,8 @@ mod tests {
         }
     }
 
-    #[test]
     /// Multiple RCUs interacting.
+    #[test]
     fn rcu() {
         const ITERATIONS: usize = 50;
         const THREADS: usize = 10;
@@ -834,8 +832,8 @@ mod tests {
         assert_eq!(THREADS * ITERATIONS, *shared.load());
     }
 
-    #[test]
     /// Multiple RCUs interacting, with unwrapping.
+    #[test]
     fn rcu_unwrap() {
         const ITERATIONS: usize = 50;
         const THREADS: usize = 10;
@@ -850,5 +848,31 @@ mod tests {
             }
         });
         assert_eq!(THREADS * ITERATIONS, *shared.load());
+    }
+
+    /// Test the guard can outlive the `ArcSwap` it comes from without problems.
+    #[test]
+    fn guard_outlive() {
+        let s = ArcSwap::from(Arc::new(42));
+        let g = s.peek();
+        drop(s);
+        let a = Guard::upgrade(&g);
+        drop(g);
+        assert_eq!(1, Arc::strong_count(&a));
+    }
+
+    /// ZSTs are special. Make sure they don't break things here.
+    #[test]
+    fn zst() {
+        let s1 = ArcSwap::from(Arc::new(()));
+        let s2 = ArcSwap::from(Arc::new(()));
+        let a1 = s1.load();
+        let a2 = s2.load();
+        assert_eq!(2, Arc::strong_count(&a1));
+        assert_eq!(2, Arc::strong_count(&a2));
+        s1.store(Arc::new(()));
+        assert_eq!(1, Arc::strong_count(&a1));
+        drop(s2);
+        assert_eq!(1, Arc::strong_count(&a2));
     }
 }

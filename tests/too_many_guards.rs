@@ -12,6 +12,9 @@ const ITER: usize = 100;
 /// Test the case when we have more guards than reasonable.
 ///
 /// This'll allocate further thread debt nodes, exercising one of the fallback code paths.
+///
+/// Note that this test is alone in the process, because it doesn't want interference with the
+/// global debt list.
 #[test]
 fn too_many_guards() {
     let bar = Barrier::new(PARAL);

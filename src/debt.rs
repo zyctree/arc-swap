@@ -402,7 +402,8 @@ mod tests {
                         let val = slot.load(Ordering::Relaxed);
                         println!("{:4}: Node {:p} slot {:p} = {:X}", i, n, slot, val);
                         if val == TEST_PTR_3 {
-                            cnt.fetch_add(1, Ordering::Relaxed);
+                            let cnt = cnt.fetch_add(1, Ordering::Relaxed);
+                            println!("{}", cnt);
                         }
                     }
                     None::<()>

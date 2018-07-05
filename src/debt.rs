@@ -200,6 +200,7 @@ pub(crate) struct Debt {
 
 impl Debt {
     pub(crate) fn new(ptr: usize, alloc_mode: AllocMode) -> Debt {
+        debug_assert_ne!(ptr, EMPTY_SLOT);
         let head = get_head(alloc_mode);
         let mut it = 0usize;
         loop {
@@ -264,6 +265,7 @@ impl Debt {
             if ptr == current {
                 return debt;
             }
+            debug_assert_ne!(current, EMPTY_SLOT);
             if !debt.replace(current) {
                 return debt;
             }

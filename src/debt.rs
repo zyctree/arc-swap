@@ -288,6 +288,7 @@ impl Debt {
                     if s.compare_exchange(ptr, EMPTY_SLOT, Ordering::AcqRel, Ordering::Relaxed)
                         .is_ok()
                     {
+                        println!("Pay on slot {:p}", s);
                         pay();
                     }
                 }
@@ -398,7 +399,9 @@ mod tests {
             let count_ptr_3 = || {
                 let _ = traverse(Node::load(&HEAD), |n| {
                     for slot in &n.slots {
-                        if slot.load(Ordering::Relaxed) == TEST_PTR_3 {
+                        let val = slot.load(Ordering::Relaxed);
+                        println!("Node {:p} slot {:p} = {:X}", n, slot, val);
+                        if val == TEST_PTR_3 {
                             cnt.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -433,6 +436,7 @@ mod tests {
             assert_eq!(2, cnt.swap(0, Ordering::Relaxed));
 
             Debt::pay_all(TEST_PTR_3, || {
+                println!("Pay!");
                 cnt.fetch_add(1, Ordering::Relaxed);
             });
             assert_eq!(2, cnt.load(Ordering::Relaxed));

@@ -230,6 +230,11 @@ impl Debt {
                 let new = Node::link_new(prev, head, ptr, false);
                 // Let the next thread find this new node faster, there are 3 empty slots now.
                 HEAD.store(new.ptr(), Ordering::Release);
+                return Debt {
+                    ptr,
+                    slot: &new.slots[0],
+                    active: true,
+                };
             } else {
                 it = it.wrapping_add(1);
                 if it % YIELD_EVERY == 0 {

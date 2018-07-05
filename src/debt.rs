@@ -50,6 +50,8 @@ impl Node {
 
         let new = Box::leak(Box::new(new));
 
+        println!("Linking new node {:p} with {:X}", new, first);
+
         while let Err(next) = prev.next.compare_exchange(
             current.ptr(),
             new.ptr(),

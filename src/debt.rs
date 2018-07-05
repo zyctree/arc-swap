@@ -186,6 +186,7 @@ fn get_head(alloc_mode: AllocMode) -> &'static Node {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct Debt {
     ptr: usize,
     slot: &'static AtomicUsize,
@@ -203,8 +204,10 @@ impl Debt {
                     return None;
                 }
                 node.slots.iter().find(|slot| {
-                    slot.compare_exchange(EMPTY_SLOT, ptr, Ordering::SeqCst, Ordering::Relaxed)
-                        .is_ok()
+                    let res = slot.compare_exchange(EMPTY_SLOT, ptr, Ordering::SeqCst, Ordering::Relaxed)
+                        .is_ok();
+                    println!("Tried slot {:p}: {}", slot, res);
+                    res
                 })
             });
 
@@ -399,10 +402,10 @@ mod tests {
             let count_ptr_3 = || {
                 let _ = traverse(Node::load(&HEAD), |n| {
                     for slot in &n.slots {
-                        let val = slot.load(Ordering::Relaxed);
+                        let val = slot.load(Ordering::SeqCst);
                         println!("{:4}: Node {:p} slot {:p} = {:X}", i, n, slot, val);
                         if val == TEST_PTR_3 {
-                            let cnt = cnt.fetch_add(1, Ordering::Relaxed);
+                            let cnt = cnt.fetch_add(1, Ordering::SeqCst);
                             println!("{}", cnt);
                         }
                     }
@@ -410,45 +413,48 @@ mod tests {
                 });
             };
             count_ptr_3();
-            assert_eq!(0, cnt.swap(0, Ordering::Relaxed));
+            assert_eq!(0, cnt.swap(0, Ordering::SeqCst));
 
             let mut debt_1 = Debt::new(TEST_PTR_3, AllocMode::Allowed);
+            println!("{:?}", debt_1);
             let mut debt_2 = Debt::new(TEST_PTR_3, AllocMode::Allowed);
+            println!("{:?}", debt_2);
             let mut debt_3 = Debt::new(TEST_PTR_3, AllocMode::Allowed);
+            println!("{:?}", debt_3);
 
             assert_eq!(debt_1.ptr, TEST_PTR_3);
-            assert_eq!(debt_1.slot.load(Ordering::Relaxed), TEST_PTR_3);
+            assert_eq!(debt_1.slot.load(Ordering::SeqCst), TEST_PTR_3);
 
             assert_eq!(debt_2.ptr, TEST_PTR_3);
-            assert_eq!(debt_2.slot.load(Ordering::Relaxed), TEST_PTR_3);
+            assert_eq!(debt_2.slot.load(Ordering::SeqCst), TEST_PTR_3);
 
             assert_eq!(debt_3.ptr, TEST_PTR_3);
-            assert_eq!(debt_3.slot.load(Ordering::Relaxed), TEST_PTR_3);
+            assert_eq!(debt_3.slot.load(Ordering::SeqCst), TEST_PTR_3);
 
             count_ptr_3();
-            assert_eq!(3, cnt.swap(0, Ordering::Relaxed));
+            assert_eq!(3, cnt.swap(0, Ordering::SeqCst));
 
             assert!(debt_3.replace(TEST_PTR_4));
 
             assert_eq!(debt_3.ptr, TEST_PTR_4);
-            assert_eq!(debt_3.slot.load(Ordering::Relaxed), TEST_PTR_4);
+            assert_eq!(debt_3.slot.load(Ordering::SeqCst), TEST_PTR_4);
 
             count_ptr_3();
-            assert_eq!(2, cnt.swap(0, Ordering::Relaxed));
+            assert_eq!(2, cnt.swap(0, Ordering::SeqCst));
 
             Debt::pay_all(TEST_PTR_3, || {
                 println!("Pay!");
-                cnt.fetch_add(1, Ordering::Relaxed);
+                cnt.fetch_add(1, Ordering::SeqCst);
             });
-            assert_eq!(2, cnt.swap(0, Ordering::Relaxed));
+            assert_eq!(2, cnt.swap(0, Ordering::SeqCst));
             count_ptr_3();
-            assert_eq!(0, cnt.swap(0, Ordering::Relaxed));
+            assert_eq!(0, cnt.swap(0, Ordering::SeqCst));
 
             assert!(!debt_1.replace(TEST_PTR_4));
             assert_eq!(debt_1.ptr, TEST_PTR_3);
             assert!(!debt_1.active);
             // We can't really do this, other test might have used that slot already!
-            // assert_eq!(debt_1.slot.load(Ordering::Relaxed), EMPTY_SLOT);
+            // assert_eq!(debt_1.slot.load(Ordering::SeqCst), EMPTY_SLOT);
 
             assert!(!debt_2.pay());
             assert!(debt_3.pay());

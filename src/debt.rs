@@ -222,7 +222,7 @@ impl Debt {
             if alloc_mode == AllocMode::Allowed {
                 let new = Node::link_new(prev, head, ptr, false);
                 // Let the next thread find this new node faster, there are 3 empty slots now.
-                HEAD.store(new.ptr(), Ordering::Relaxed);
+                HEAD.store(new.ptr(), Ordering::Release);
             } else {
                 it = it.wrapping_add(1);
                 if it % YIELD_EVERY == 0 {
@@ -285,7 +285,7 @@ impl Debt {
         assert!(
             traverse(head, |n| {
                 for s in &n.slots {
-                    if s.compare_exchange(ptr, EMPTY_SLOT, Ordering::AcqRel, Ordering::Relaxed)
+                    if s.compare_exchange(ptr, EMPTY_SLOT, Ordering::Relaxed, Ordering::Relaxed)
                         .is_ok()
                     {
                         pay();

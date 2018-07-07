@@ -33,14 +33,16 @@
 //!
 //! # Performance characteristics
 //!
-//! Only very basic benchmarks were done so far (you can find them in the git repository). These
-//! suggest this is slightly faster than using a mutex in most cases.
+//! Benchmarks suggest this is slightly faster than a mutex in all cases, especially when there are
+//! multiple concurrent readers.
 //!
-//! Furthermore, this implementation doesn't suffer from contention. Specifically, arbitrary number
-//! of readers can access the shared value and won't block each other, and are not blocked by
-//! writers.  The writers will be somewhat slower when there are active readers at the same time,
-//! but won't be stopped indefinitely. Readers always perform the same number of instructions,
-//! without any locking or waiting.
+//! This implementation doesn't suffer from contention. Specifically, arbitrary number of readers
+//! can access the shared value and won't block each other. There's however some slowdown in such
+//! case (profiling will have to show the reason for that, in theory there should not be). The
+//! performance of the writers degrades with the peak number of threads participating and in the
+//! number of held references.
+//!
+//! In other words, both readers and writers are lock-free.
 //!
 //! # RCU
 //!
@@ -54,12 +56,19 @@
 //! functions one might use inside them. Specifically, it is *not* allowed to use mutexes inside
 //! them (because that could cause a deadlock).
 //!
-//! On the other hand, it is possible to use [`ArcSwap::load`](struct.ArcSwap.html#method.load)
-//! (but not the others). Note that the signal handler is not allowed to allocate or deallocate
-//! memory. This also means the signal handler must not drop the last reference to the `Arc`
-//! received by loading ‒ therefore, the part changing it from the outside needs to make sure it
-//! does not drop the only other instance once it swapped the content while the signal handler
-//! still runs. See [`ArcSwap::rcu_unwrap`](struct.ArcSwap.html#method.rcu_unwrap).
+//! The library provides some methods that are safe to use in signal handlers. If they have the
+//! [`AllocMode`](enum.AllocMode.html) parameter, `SignalSafe` variant must be used in such case.
+//!
+//! The safe methods are:
+//! * [`peek_with_alloc`](struct.ArcSwap.html#method.peek_with_alloc)
+//! * [`swap`](struct.ArcSwap.html#method.swap)
+//! * [`store`](struct.ArcSwap.html#method.store)
+//! * [`compare_and_swap`](struct.ArcSwap.html#method.compare_and_swap)
+//! * [`Guard::upgrade`](struct.Guard.html#method.upgrade)
+//!
+//! Technically, the signal safe mode isn't fully lock-free and there's only limited number of
+//! slots specifically reserved for signal handlers. Therefore it is advised to limit the number of
+//! held references inside a signal handler.
 //!
 //! # Example
 //!
@@ -99,6 +108,8 @@
 //! [`Mutex`]: https://doc.rust-lang.org/std/sync/struct.Mutex.html
 //! [`shared_ptr`]: http://en.cppreference.com/w/cpp/memory/shared_ptr
 
+pub mod as_raw;
+
 mod debt;
 
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
@@ -110,84 +121,10 @@ use std::thread;
 
 pub use debt::AllocMode;
 
+use as_raw::AsRaw;
 use debt::Debt;
 
-// TODO: This is all wrong. And docs too.
-// # Implementation details
-//
-// The first idea would be to just use AtomicPtr with whatever the Arc::into_raw returns. Then
-// replacing it would be fine (there's no need to update ref counts). The load needs to increment
-// the reference count ‒ one still stays inside and another is returned to the caller. This is done
-// by re-creating the Arc from the raw pointer and then cloning it, throwing one instance away
-// (without destroying it).
-//
-// This approach has a problem. There's a short time between we read the raw pointer and increment
-// the count. If some other thread replaces the stored Arc and throws it away, the ref count could
-// drop to 0, get destroyed and we would be trying to bump ref counts in a ghost, which would be
-// totally broken.
-//
-// To prevent this, the readers work as usual, but register themselves so they can be tracked. Each
-// writer first switches the pointer. Then it takes a snapshot of all the current readers and waits
-// until all of them confirm bumping their reference count. Only then the writer returns to the
-// caller, handing it the ownership of the Arc and allowing possible bad things (like being
-// destroyed) to happen to it.
-//
-// # Unsafety
-//
-// All the uses of the unsafe keyword is just to turn the raw pointer back to Arc. It originated
-// from an Arc in the first place, so the only thing to ensure is it is still valid. That means its
-// ref count never dropped to 0.
-//
-// At the beginning, there's ref count of 1 stored in the raw pointer (and maybe some others
-// elsewhere, but we can't rely on these). This 1 stays there for the whole time the pointer is
-// stored there. When the arc is replaced, this 1 is returned to the caller, so we just have to
-// make sure no more readers access it by that time.
-//
-// # Tracking of readers
-//
-// The simple way would be to have a count of all readers that could be in the dangerous area
-// between reading the pointer and bumping the reference count. We could „lock“ the ref count by
-// incrementing this atomic counter and „unlock“ it when done. The writer would just have to
-// busy-wait for this number to drop to 0 ‒ then there are no readers at all. This is safe, but a
-// steady inflow of readers could make a writer wait forever.
-//
-// Therefore, we separate readers into two groups, odd and even ones (see below how). When we see
-// both groups to drop to 0 (not necessarily at the same time, though), we are sure all the
-// previous readers were flushed ‒ each of them had to be either odd or even.
-//
-// To do that, we define a generation. A generation is a number, incremented at certain times and a
-// reader decides by this number if it is odd or even.
-//
-// One of the writers may increment the generation when it sees a zero in the next-generation's
-// group (if the writer sees 0 in the odd group and the current generation is even, all the current
-// writers are even ‒ so it remembers it saw odd-zero and increments the generation, so new readers
-// start to appear in the odd group and the even has a chance to drop to zero later on). Only one
-// writer does this switch, but all that witness the zero can remember it.
-//
-// # Memory orders
-//
-// We need to make sure several things happen or don't.
-//
-// First, we have to guarantee the target of the pointer is visible in whatever thread receives a
-// copy of the Arc. Having AcqRel on the swap (because it can both publish and read the pointer)
-// and Acquire on the load is enough for this purpose.
-//
-// Second, the dangerous area when we borrowed the pointer but haven't yet incremented its ref
-// count needs to stay between incrementing and decrementing the reader count (in either group). To
-// accomplish that, using Acquire on the increment and Release on the decrement would be enough.
-// The loads in the writer use Acquire to complete the edge and make sure no part of the dangerous
-// area leaks outside of it in the writers view.
-//
-// Now the hard part :-). We need to ensure that whatever zero a writer sees is not stale in the
-// sense that it happened before the switch of the pointer. In other words, we need to make sure
-// that at the time we start to look for the zeroes, we already see all the current readers. To do
-// that, we need to synchronize the time lines of the pointer itself and the corresponding group
-// counters. As these are separate, unrelated, atomics, it calls for SeqCst ‒ on the swap and on
-// the increment. This'll guarantee that they'll know which happened first (either increment or the
-// swap), making a base line for the following operations (load of the pointer or looking for
-// zeroes).
-//
-// All other operations can be Relaxed.
+// TODO: Describe the inner workings and why it is safe.
 
 /// A short-term proxy object from [`peek`](struct.ArcSwap.html#method.peek)
 ///
@@ -307,6 +244,9 @@ impl<T> From<Arc<T>> for ArcSwap<T> {
 impl<T> Drop for ArcSwap<T> {
     fn drop(&mut self) {
         let ptr = *self.ptr.get_mut();
+        // Note: the extract associated function pays all the debts on this. We are doing drop, so
+        // this is the only instance here and therefore it is safe to assume more won't be created.
+        // So Guards can live on.
         drop(Self::extract(ptr));
     }
 }
@@ -330,10 +270,14 @@ impl<T: Display> Display for ArcSwap<T> {
 }
 
 impl<T> ArcSwap<T> {
+    /// Removes one reference from this pointer (or, the Arc belonging to this pointer).
     fn dispose(ptr: *const T) {
         drop(unsafe { Arc::from_raw(ptr) });
     }
 
+    /// Increases the reference on the pointer and turns it into an Arc.
+    ///
+    /// If the debt was already paid by someone else, the reference is not increased.
     fn load_bump(ptr: *const T, mut debt: Debt) -> Arc<T> {
         let arc = unsafe { Arc::from_raw(ptr) };
         // Bump the reference count by one, so we can return one into the arc and another to
@@ -346,12 +290,16 @@ impl<T> ArcSwap<T> {
         }
         arc
     }
+
     /// Loads the value.
     ///
     /// This makes another copy (reference) and returns it, atomically (it is safe even when other
     /// thread stores into the same instance at the same time).
     ///
-    /// The method is lock-free and wait-free.
+    /// The method is lock-free.
+    ///
+    /// This method is *not* safe inside signal handlers. Use
+    /// [`peek_with_alloc`](#method.peek_with_alloc) for that.
     pub fn load(&self) -> Arc<T> {
         Guard::upgrade(&self.peek())
     }
@@ -362,21 +310,24 @@ impl<T> ArcSwap<T> {
     /// faster than [`load`](#method.load), but it is not suitable for holding onto for longer
     /// periods of time.
     ///
-    /// If you discover later on that you need to hold onto it for longer, you can [`
+    /// If you discover later on that you need to hold onto it for longer, you can
+    /// [`Gruard::upgrade`](struct.Guard.html#method.upgrade) it.
     ///
     /// # Warning
     ///
-    /// This currently prevents the `Arc` inside from being replaced. Any [`swap`](#method.swap),
-    /// [`store`](#method.store) or [`rcu`](#method.rcu) will busy-loop while waiting for the proxy
-    /// object to be destroyed. Therefore, this is suitable only for things like reading a
-    /// (reasonably small) configuration value, but not for eg. computations on the held values.
+    /// The performance of both reads and writes decrease with the (global) number of guards alive.
+    /// Therefore, this is more suitable to have a one-time look into the data than storing in some
+    /// data structures. Prefer [`load`](#method.load) for that and store the actual `Arc`.
     ///
-    /// If you are not sure what is better, benchmarking is recommended.
+    /// This method is *not* safe inside signal handlers. Use
+    /// [`peek_with_alloc`](#method.peek_with_alloc) for that.
     pub fn peek(&self) -> Guard<T> {
         self.peek_with_alloc(AllocMode::Allowed)
     }
 
-    /// TODO
+    /// Loans the value for a short time, with specified allocation mode.
+    ///
+    /// See details at [`AllocMode`](enum.AllocMode.html).
     pub fn peek_with_alloc(&self, alloc_mode: AllocMode) -> Guard<T> {
         let debt = Debt::confirmed(alloc_mode, || self.ptr.load(Ordering::Relaxed) as usize);
         let ptr = debt.ptr() as *const T;
@@ -395,6 +346,10 @@ impl<T> ArcSwap<T> {
         drop(self.swap(arc));
     }
 
+    /// Takes the raw pointer, pays all the debt related to it and turns it into an `Arc`.
+    ///
+    /// This is a helper function for things like `swap`, when the inner pointer is being
+    /// extracted and leaves the `ArcSwap`.
     fn extract(old: *const T) -> Arc<T> {
         let old_ptr = old as usize;
         let old_arc = unsafe { Arc::from_raw(old) };
@@ -407,10 +362,6 @@ impl<T> ArcSwap<T> {
     }
 
     /// Exchanges the value inside this instance.
-    ///
-    /// While multiple `swap`s can run concurrently and won't block each other, each one needs to
-    /// wait for all the [`load`s](#method.load) that have seen the old value to finish before
-    /// returning.
     pub fn swap(&self, arc: Arc<T>) -> Arc<T> {
         let new = strip(arc);
         // AcqRel needed to publish the target of the new pointer and get the target of the old
@@ -426,28 +377,44 @@ impl<T> ArcSwap<T> {
     /// If the current value of the `ArcSwap` is equal to `current`, the `new` is stored inside. If
     /// not, nothing happens.
     ///
-    /// True is returned as the first part of result if it did swap content, false otherwise.
-    /// Either way, the previous content is returned as the second part. The property of standard
-    /// library atomics that if previous is the same as current, the swap happened, is still true,
-    /// but unlike the values in the atomics, `Arc` is not copy ‒ therefore, you may want to pass
-    /// the only instance of current into it and not clone it just to compare.
+    /// The previous value is returned. It can be used to check if the change actually happened.
     ///
     /// In other words, if the caller „guesses“ the value of current correctly, it acts like
     /// [`swap`](#method.swap), otherwise it acts like [`load`](#method.load) (including the
     /// limitations).
-    pub fn compare_and_swap(
+    ///
+    /// The previous can be either an `Arc` or a [`Guard`](struct.Guard.html) returned by
+    /// [`peek`](#method.peek).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arc_swap::{AllocMode, ArcSwap};
+    ///
+    /// let arc = Arc::new(42);
+    /// let arc_swap = ArcSwap::from(Arc::clone(&arc));
+    /// let another = Arc::new(0);
+    ///
+    /// let orig = arc_swap.compare_and_swap(&another, Arc::clone(&another), AllocMode::Allowed);
+    /// assert!(Arc::ptr_eq(&arc, &orig));
+    /// assert_eq!(42, *arc_swap.peek());
+    ///
+    /// let orig = arc_swap.compare_and_swap(&arc, another, AllocMode::Allowed);
+    /// assert!(Arc::ptr_eq(&arc, &orig));
+    /// assert_eq!(0, *arc_swap.peek());
+    /// ```
+    pub fn compare_and_swap<C: AsRaw<T>>(
         &self,
-        current: Arc<T>,
+        current: &C,
         new: Arc<T>,
         alloc_mode: AllocMode,
-    ) -> (bool, Arc<T>) {
+    ) -> Arc<T> {
         // As noted above, this method has either semantics of load or of store. We don't know
         // which ones upfront, so we need to implement safety measures for both.
-        let current = strip(current);
-        // We get rid of current
-        // TODO: Could we use some trick to pass only reference?
-        Self::dispose(current);
+        let current = current.as_raw() as *mut _;
         let new = strip(new);
+        let mut debt_store = None;
 
         'outer: loop {
             let previous = self.ptr.compare_and_swap(current, new, Ordering::SeqCst);
@@ -455,22 +422,24 @@ impl<T> ArcSwap<T> {
 
             if swapped {
                 // New went into us, so leave it at that
-                return (true, Self::extract(previous));
+                return Self::extract(previous);
             } else {
-                let mut debt = Debt::new(previous as usize, alloc_mode);
+                let mut debt =
+                    debt_store.unwrap_or_else(|| Debt::new(previous as usize, alloc_mode));
                 let mut previous = previous;
                 loop {
                     let confirm = self.ptr.load(Ordering::Relaxed);
                     if confirm == previous {
                         Self::dispose(new);
-                        return (false, Self::load_bump(previous, debt));
+                        return Self::load_bump(previous, debt);
                     } else if confirm == current {
-                        continue 'outer; // TODO: Something with the debt, reuse
+                        debt_store = Some(debt);
+                        continue 'outer;
                     } else if debt.replace(confirm as usize) {
                         previous = confirm;
                     } else {
                         Self::dispose(new);
-                        return (false, Self::load_bump(previous, debt));
+                        return Self::load_bump(previous, debt);
                     }
                 }
             }
@@ -487,6 +456,10 @@ impl<T> ArcSwap<T> {
     /// independent of the previous onse, simple [`swap`](#method.swap) or [`store`](#method.store)
     /// is enough. Otherwise, it may be needed to retry the update operation if some other thread
     /// made an update in between. This is what this method does.
+    ///
+    /// # Signal safety
+    ///
+    /// This method is *not* safe to use inside signal handlers.
     ///
     /// # Examples
     ///
@@ -604,7 +577,8 @@ impl<T> ArcSwap<T> {
         let mut cur = self.load();
         loop {
             let new = f(&cur).into();
-            let (swapped, prev) = self.compare_and_swap(cur, new, AllocMode::Allowed);
+            let prev = self.compare_and_swap(&cur, new, AllocMode::Allowed);
+            let swapped = Arc::ptr_eq(&cur, &prev);
             if swapped {
                 return prev;
             } else {
@@ -628,6 +602,10 @@ impl<T> ArcSwap<T> {
     /// left to random reader (the last one to hold the old value), it could cause a timeout or
     /// jitter in a query time. With this, the deallocation is done in the updater thread,
     /// therefore outside of a hot path.
+    ///
+    /// # Signal safety
+    ///
+    /// This method is *not* safe inside signal handlers.
     ///
     /// # Warning
     ///
@@ -788,9 +766,7 @@ mod tests {
             assert_eq!(2, Arc::strong_count(&orig));
             let n1 = Arc::new(i + 1);
             // Success
-            let (swapped, prev) =
-                shared.compare_and_swap(Arc::clone(&orig), Arc::clone(&n1), AllocMode::Allowed);
-            assert!(swapped);
+            let prev = shared.compare_and_swap(&orig, Arc::clone(&n1), AllocMode::Allowed);
             assert!(Arc::ptr_eq(&orig, &prev));
             // One for orig, one for prev
             assert_eq!(2, Arc::strong_count(&orig));
@@ -800,9 +776,7 @@ mod tests {
             let n2 = Arc::new(i);
             drop(prev);
             // Failure
-            let (swapped, prev) =
-                shared.compare_and_swap(Arc::clone(&orig), Arc::clone(&n2), AllocMode::Allowed);
-            assert!(!swapped);
+            let prev = shared.compare_and_swap(&orig, Arc::clone(&n2), AllocMode::Allowed);
             assert!(Arc::ptr_eq(&n1, &prev));
             // One for orig
             assert_eq!(1, Arc::strong_count(&orig));

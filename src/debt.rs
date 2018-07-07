@@ -1,27 +1,70 @@
+//! A backend module to track debts.
+//!
+//! A debt is a missing strong reference count inside an `Arc`. This is OK as long as the `Arc` has
+//! at least one reference inside the `ArcSwap` ‒ that prevents it from being destroyed or turned
+//! into inner. But these debts must be paid before the `Arc` leaves.
+//!
+//! The structure is a cyclic linked list. Each active thread owns a node where it tries to insert
+//! its debts and if it can't find a free slot, it continues to following nodes until one is found
+//! or the whole cycle is traversed. In the latter case, a new node is inserted (unowned).
+//!
+//! There's also a global head for the list, which changes from time to time, to distribute the
+//! load across the nodes.
+//!
+//! There are some corner-cases ‒ support for signal handlers and modes that are not allowed to
+//! allocate can lead to situations where a thread doesn't own a head, or when the thread is being
+//! shut down and thread local storage is already deinitialized.
+
 use std::cell::Cell;
 use std::ptr;
 use std::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::thread;
 
-/// TODO
+/// Describes allowed allocation strategy.
+///
+/// The [`Guard`](struct.Guard.html) and read methods need a slot inside a global list.
+/// Each thread also holds its own list node with several slots. If you keep too many `Guard`s or
+/// if a new thread is started, it may be useful or even needed to allocate. This describes under
+/// which circumstances it is possible to do.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum AllocMode {
-    /// TODO
+    /// The algorithm can allocate whenever it wishes.
     Allowed,
-    /// TODO
+    /// The algorithm can allocate when a new thread started.
+    ///
+    /// However, if there aren't enough slots, it'll block (and busy-loop) until some are released
+    /// by other threads. This may lead to a deadlock if all the guards are owned by this thread.
+    /// You should prefer not to use this unless you know what you're doing.
     ThreadHead,
-    /// TODO
+    /// No allocation is allowed.
+    ///
+    /// The same busy looping as with `ThreadHead` can happen. Furthermore, the current thread may
+    /// not have its own node with slots and the performance in normal (when not full) situation
+    /// will be degraded.
     Disallowed,
-    /// TODO
+    /// A mode safe to use in signal handlers.
+    ///
+    /// In addition to not allowing any allocations, it also can't use thread local storage and
+    /// never uses the „this thread's“ node optimisation. The performance is expected to be worse
+    /// than with allowed allocation, so use *only* in signal handlers.
+    ///
+    /// To avoid the busy-looping and deadlocking, signal handlers have a small global reserve just
+    /// for their use.
     SignalSafe,
 }
 
+/// Number of slots in each node.
 const SLOT_CNT: usize = 4;
+/// A marker of empty slot.
+///
+/// We don't assume NULL = 0 (no idea if Rust aims at any like these). But we assume all pointers
+/// inside Arcs are aligned to at least 2, because there are the two counts which are usizes.
 const EMPTY_SLOT: usize = 1;
+/// Whenever busy-looping, do a full yield this many iterations.
 const YIELD_EVERY: usize = 8;
 
-// Note: Make sure *not* to derive any clone or eq, so it is not misused by accident.
-#[derive(Debug)]
+/// One node of the global debt list
+#[derive(Debug)] // Note: Make sure *not* to derive any clone or eq ‒ high risk of footguns here.
 struct Node {
     slots: [AtomicUsize; SLOT_CNT],
     owned: AtomicBool,
@@ -30,6 +73,10 @@ struct Node {
 }
 
 impl Node {
+    /// Create a new node and link it into the global list.
+    ///
+    /// It creates a new owned node, fills in the first slot and links it after the `prev` node.
+    /// The `current` node is a hint what the caller things is the one after `prev`.
     fn link_new(
         prev: &'static Node,
         mut current: &'static Node,
@@ -63,15 +110,20 @@ impl Node {
         new
     }
 
+    /// Loads a node from an atomic pointer.
     fn load(from: &AtomicPtr<Node>) -> &'static Node {
         let ptr = from.load(Ordering::Acquire);
         unsafe { ptr.as_ref().unwrap() }
     }
 
+    /// Turns the node reference into a raw pointer.
     fn ptr(&self) -> *mut Node {
         self as *const _ as *mut _
     }
 
+    /// Tries to claim ownership of the node.
+    ///
+    /// Returns success or failure.
     fn claim(&self) -> bool {
         if self.reserve {
             // Can't claim a reserve, sorry…
@@ -81,6 +133,7 @@ impl Node {
     }
 }
 
+/// Helper macro to generate basic set of nodes to start with.
 macro_rules! node {
     ($name:ident, $next:ident, $reserve:expr) => {
         static $name: Node = Node {
@@ -97,6 +150,7 @@ macro_rules! node {
     };
 }
 
+// Basic set of nodes, some of them are reserves. Forms a base of a cyclic linked list.
 node!(N1, N2, false);
 node!(N2, N3, false);
 node!(N3, R1, false);
@@ -104,8 +158,10 @@ node!(R1, R2, true);
 node!(R2, R3, true);
 node!(R3, N1, true);
 
+/// Global head to the cyclic linked list.
 static HEAD: AtomicPtr<Node> = AtomicPtr::new(&N1 as *const _ as *mut _);
 
+/// A hint for each thread to know where to start.
 struct ThreadHint(Cell<Option<&'static Node>>);
 
 impl Drop for ThreadHint {
@@ -120,6 +176,12 @@ thread_local! {
     static THREAD_HINT: ThreadHint = ThreadHint(Cell::new(None));
 }
 
+/// Goes through the cyclic linked list.
+///
+/// It tries to search the linked list according to the given predicate. If the predicate returns
+/// `Some` value, the value is returned as successful result. If the whole list is traversed
+/// without matching, an error result is returned with the last node visited (one that points to
+/// `head`.
 fn traverse<R, F>(head: &'static Node, f: F) -> Result<R, &'static Node>
 where
     F: Fn(&'static Node) -> Option<R>,
@@ -139,6 +201,17 @@ where
     }
 }
 
+/// Gets a head of the cyclic linked list.
+///
+/// Since the list is cyclic, it doesn't matter much which node is considered as the head. But this
+/// one picks a head for the caller, solving some corner cases.
+///
+/// * If a thread local hint for an already owned head is available, it is used.
+/// * If not, it searches for a node it can claim, sets it into the thread local storage for future
+///   and returns that one.
+/// * If none can be claimed and allocation is allowed, a new one is allocated.
+/// * If all of the above fails or signal-safe allocation mode is used, an arbitrary node is
+///   returned without claiming ownership.
 fn get_head(alloc_mode: AllocMode) -> &'static Node {
     // Look if we already have a thread hint. Signal handlers aren't allowed to touch the thread
     // local storage (because the data there is neither atomic, not `volatile sigatomic_t`).
@@ -192,6 +265,9 @@ fn get_head(alloc_mode: AllocMode) -> &'static Node {
     }
 }
 
+/// A representation of one debt.
+///
+/// The debt may be already paid for.
 pub(crate) struct Debt {
     ptr: usize,
     slot: &'static AtomicUsize,
@@ -199,6 +275,10 @@ pub(crate) struct Debt {
 }
 
 impl Debt {
+    /// Allocates a new debt slot.
+    ///
+    /// Finds a free slot for a debt and uses it, by putting the provided `ptr` into it. Note that
+    /// by the time this finishes, the loaded pointer might already be stale.
     pub(crate) fn new(ptr: usize, alloc_mode: AllocMode) -> Debt {
         debug_assert_ne!(ptr, EMPTY_SLOT);
         let head = get_head(alloc_mode);
@@ -246,6 +326,10 @@ impl Debt {
         }
     }
 
+    /// Replaces the pointer inside the debt.
+    ///
+    /// Returns false if the debt for the previous pointer was already paid. In such case, the debt
+    /// is not changed and is still considered already paid.
     pub(crate) fn replace(&mut self, ptr: usize) -> bool {
         if self.active
             && self
@@ -261,6 +345,13 @@ impl Debt {
         }
     }
 
+    /// Creates a new debt and confirms it is valid.
+    ///
+    /// To properly claim a pointer, a debt must be noted. But because a stale value might be
+    /// noted, this also confirms the debt is still for the correct pointer by re-reading it once
+    /// more afterwards. If it changed, it tries to replace the pointer in the debt.
+    ///
+    /// The returned debt may already be paid when this returns.
     pub(crate) fn confirmed<F: Fn() -> usize>(alloc_mode: AllocMode, read_ptr: F) -> Debt {
         let mut ptr = read_ptr();
         let mut debt = Debt::new(ptr, alloc_mode);
@@ -278,21 +369,41 @@ impl Debt {
         }
     }
 
+    /// Is there still a debt?
     pub(crate) fn active(&self) -> bool {
         self.active
     }
 
+    /// The pointer for which the debt is.
     pub(crate) fn ptr(&self) -> usize {
         self.ptr
     }
 
+    /// Releases the slot and marks the debt as paid.
+    ///
+    /// It is up to the caller to actually make sure the debt is paid, this only marks it so.
+    ///
+    /// If this returns false, the debt was already paid before (maybe by someone else). In such
+    /// case the caller should compensate, because it was paid twice.
     pub(crate) fn pay(&mut self) -> bool {
         let result = self.replace(EMPTY_SLOT);
         self.active = false;
         result
     }
 
-    // TODO: Document the pre-charge
+    /// Pays all the debts of the given pointer.
+    ///
+    /// Traverses the whole linked list, paying off all the debts by calling the provided closure.
+    ///
+    /// # Note
+    ///
+    /// * If the pointer is still active somewhere, new debts may appear. But that's OK, because
+    ///   once *that* instance of the pointer will leave, it'll also pay all remaining debts.
+    /// * The closure is called *after* claiming the debt. That is technically wrong (but can't
+    ///   reasonably be done in other way), therefore the caller is supposed to „pre-pay“ one
+    ///   strong count and then decrement it once more after this is done. Therefore, there'd be no
+    ///   time when it is short one count, but there are times when there's one extra ‒ which is
+    ///   safe to do.
     pub(crate) fn pay_all<P: Fn()>(ptr: usize, pay: P) {
         let head = Node::load(&HEAD);
         assert!(

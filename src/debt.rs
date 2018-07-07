@@ -100,9 +100,12 @@ impl Node {
         while let Err(next) = prev.next.compare_exchange_weak(
             current.ptr(),
             new.ptr(),
+            // To publish the data
             Ordering::Release,
+            // Will retry and do the release on the next try
             Ordering::Relaxed,
         ) {
+            // Will be published with the next link attempt
             new.next.store(next, Ordering::Relaxed);
             current = unsafe { next.as_ref().unwrap() };
         }
@@ -112,6 +115,7 @@ impl Node {
 
     /// Loads a node from an atomic pointer.
     fn load(from: &AtomicPtr<Node>) -> &'static Node {
+        // To get any new content of the node
         let ptr = from.load(Ordering::Acquire);
         unsafe { ptr.as_ref().unwrap() }
     }
@@ -129,6 +133,8 @@ impl Node {
             // Can't claim a reserve, sorry…
             return false;
         }
+        // Does not synchronize anything else, only to claim the ownership ‒ and that's enough with
+        // having a separate timeline for this atomic only.
         !self.owned.compare_and_swap(false, true, Ordering::Relaxed)
     }
 }
@@ -167,6 +173,8 @@ struct ThreadHint(Cell<Option<&'static Node>>);
 impl Drop for ThreadHint {
     fn drop(&mut self) {
         if let Some(node) = self.0.get() {
+            // Does not synchronize with anything else, just with itself so someone can claim it ‒
+            // independent timeline.
             assert!(node.owned.swap(false, Ordering::Relaxed));
         }
     }
@@ -234,11 +242,14 @@ fn get_head(alloc_mode: AllocMode) -> &'static Node {
     let prev = match found {
         Ok(node) => {
             // Update the head so we start searching from some other place next time.
+            // (doesn't publish or get any new info, just turns the wheel a bit, only optimisation
+            // ‒ it wouldn't matter much if someone got the stale info)
             HEAD.store(node.ptr(), Ordering::Relaxed);
             // Also update our thread hint once we claimed it (and ignore errors if we are shutting
             // down the thread)
             if THREAD_HINT.try_with(|h| h.0.set(Some(node))).is_err() {
                 // In case the thread is already dying, we need to not claim the ownership
+                // (Relaxed: doesn't synchronize anything else, independent timeline)
                 node.owned.store(false, Ordering::Relaxed);
             }
             return node;
@@ -253,6 +264,7 @@ fn get_head(alloc_mode: AllocMode) -> &'static Node {
         // hint.
         if THREAD_HINT.try_with(|h| h.0.set(Some(new))).is_err() {
             // In case the thread is already dying, we need to not claim the ownership
+            // (Relaxed: doesn't synchronize anything else, independent timeline)
             new.owned.store(false, Ordering::Relaxed);
         }
         new
@@ -290,6 +302,9 @@ impl Debt {
                     return None;
                 }
                 node.slots.iter().find(|slot| {
+                    // The failed attempts don't matter at all, no synchronization with the rest is
+                    // needed on them. But we need to place the success attempt firmly in between
+                    // the loads.
                     slot.compare_exchange(EMPTY_SLOT, ptr, Ordering::SeqCst, Ordering::Relaxed)
                         .is_ok()
                 })
@@ -309,6 +324,7 @@ impl Debt {
             if alloc_mode == AllocMode::Allowed {
                 let new = Node::link_new(prev, head, ptr, false);
                 // Let the next thread find this new node faster, there are 3 empty slots now.
+                // (Release so the thread reading through HEAD sees the content)
                 HEAD.store(new.ptr(), Ordering::Release);
                 return Debt {
                     ptr,
@@ -332,9 +348,11 @@ impl Debt {
     /// is not changed and is still considered already paid.
     pub(crate) fn replace(&mut self, ptr: usize) -> bool {
         if self.active
+            // The order ‒ same as in new. In the failure case, we need the un-paying of the debt
+            // to stay after this, so acquire.
             && self
                 .slot
-                .compare_exchange(self.ptr, ptr, Ordering::SeqCst, Ordering::Relaxed)
+                .compare_exchange(self.ptr, ptr, Ordering::SeqCst, Ordering::Acquire)
                 .is_ok()
         {
             self.ptr = ptr;
@@ -409,7 +427,14 @@ impl Debt {
         assert!(
             traverse(head, |n| {
                 for s in &n.slots {
-                    if s.compare_exchange(ptr, EMPTY_SLOT, Ordering::Relaxed, Ordering::Relaxed)
+                    // In the success case, we need the previous payment to stay before and the
+                    // final discarge of the pre-pay after the last one, AcqRel makes it a barrier
+                    // for these.
+                    //
+                    // In the failure case, it's unrelated to our debt, we don't change anything,
+                    // so there's nothing to synchronize (and we would have seen the debt because
+                    // of the snapshot of SeqCst on swap).
+                    if s.compare_exchange(ptr, EMPTY_SLOT, Ordering::AcqRel, Ordering::Relaxed)
                         .is_ok()
                     {
                         pay();

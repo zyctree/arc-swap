@@ -44,6 +44,54 @@
 //!
 //! In other words, both readers and writers are lock-free.
 //!
+//! Also, the Arc (and the data pointed to) are dropped right away when they stop being used by all
+//! owners, and not some unspecified time in future like with a GC.
+//!
+//! # Orderings
+//!
+//! The library guarantees the orderings are strong enough to synchronize the data it points to. In
+//! other words, store of a pointer is at least `Release` and a load is at least `Acquire` in case
+//! the loaded pointer is non-null.
+//!
+//! Furthermore, each operation contains at least one `SeqCst` atomic operation, making the total
+//! order of operations well defined and „sane“. In other words, if one thread makes two stores
+//! `s1` and `s2` into two different `ArcSwap`s, if second threads observes `s2`, it must also see
+//! `s1` at that time.
+//!
+//!
+//! ```
+//! extern crate arc_swap;
+//! extern crate crossbeam_utils;
+//!
+//! use std::sync::Arc;
+//!
+//! use arc_swap::ArcSwap;
+//! use crossbeam_utils::scoped;
+//!
+//!
+//! fn main() {
+//!     let a1 = ArcSwap::from(Arc::new(1));
+//!     let a2 = ArcSwap::from(Arc::new(2));
+//!     scoped::scope(|scope| {
+//!         scope.spawn(|| {
+//!             a1.store(Arc::new(42));
+//!             a2.store(Arc::new(0));
+//!         });
+//!
+//!         scope.spawn(|| {
+//!             let v2 = a2.peek();
+//!             let v1 = a1.peek();
+//!
+//!             if *v2 == 0 {
+//!                 assert_eq!(42, *v1);
+//!             }
+//!         });
+//!     });
+//! }
+//! ```
+//!
+//! It is possible another thread loads 0 from the `a2` and 1 from `a1` (in this order).
+//!
 //! # RCU
 //!
 //! This also offers an [RCU implementation](struct.ArcSwap.html#method.rcu), for read-heavy
@@ -124,7 +172,79 @@ pub use debt::AllocMode;
 use as_raw::AsRaw;
 use debt::Debt;
 
-// TODO: Describe the inner workings and why it is safe.
+// # Inner working
+//
+// The pointer itself is stored as AtomicPtr, which is converted from and to the Arc by into_raw
+// and from_raw. The raw pointer in there holds one reference, it's only stored in a „dormant“
+// state.
+//
+// Swapping would be fine ‒ the old one is taken out with its one reference and another one would
+// go in with the reference. However, load is a bit worse ‒ it needs to create a new reference. But
+// we first need to load the pointer itself and consequently increment the reference count in the
+// pointer. There short time in between these two when the pointer is one reference short and if it
+// got swapped out and dropped, it could get destroyed. We would then try to increment a ref count
+// on a dead Arc, which is considered necromancy and UB.
+//
+// To work around this, we introduce a system of debts. If a pointer is owed a reference, it is
+// stored into a global list. We load the pointer, store the debt and recheck the pointer is still
+// valid. If it is, we know it is safe to operate on it, because it is kept alive. The load itself
+// can pay the debt or the swap operation can ‒ it pays all the debts before giving the pointer to
+// the caller. In this system, the total number of debts + strong count is equal or greater (and it
+// is equal when all the debts are dealt with) to the real number of owners.
+//
+// The strong count never drops to 0 as long as the pointer is inside, so it can't be destroyed.
+// When it leaves (through swap), all the debts are paid and turned into strong counts (sometimes
+// multiple times, which'd get compensated for later, but that is an error in the safe direction),
+// so it's up to the Arc itself to handle them and not create a dangling pointer.
+//
+// ## Unsafety
+//
+// This crate contains some amount of unsafe code. In all cases, it is to access raw pointers or to
+// convert them into something safe Rust knows how to handle. There are two sources of the raw
+// pointers.
+//
+// * Arcs. These are always originally created as Arc::into_raw and therefore can't produce
+//   „garbage“. Therefore, we need to make sure these are not accessed after their lifetime ends ‒
+//   and that's ensured by the debt system described above.
+// * Nodes in the debt list. These are always converted from references. These nodes are never
+//   freed, so there's no chance of creating dangling pointers.
+//
+// ## Atomic orderings
+//
+// (You probably want to study the code & comments in debt before going through this).
+//
+// Both load and swap (and related) contain at least one SeqCst operation on load-store atomic
+// operation. That has full AcqRel semantic. In case of swap, it happens at the AtomicPtr itself.
+// With load it happens a bit after the load (in writing the debt). Therefore, the data behind the
+// pointer is fully synchronized through this ‒ the data is published in the swap and acquired by
+// either another swap or load.
+//
+// As both the swap and writing of a new debt is SeqCst, their relative order is well defined.
+// Therefore, a debt is created in one specific „interval“ specified by swaps. As the load happens
+// on the same AtomicPtr as the swap, this is also well defined what happens before what.
+// Therefore, we can be sure that both the debt and the confirmation load happen for the same
+// „interval“. Furthermore, at the time of next swap, the swap will see all the debts from previous
+// interval. A new debt must be created after (we showed above „after“ is well defined) and the
+// load won't be able to confirm the original value. That leads to the swap knowing safely about
+// what debts need to be paid.
+//
+// Even a relative ordering is enough to claim who pays for each one debt, because it happens on a
+// single atomic.
+//
+// There are further orderings in linking new nodes into the debt list. All the ones that add there
+// are Release, and all loads on the linked list are Acquire, making sure anyone able to observe
+// the new value of the pointer can also see the data inside the nodes.
+//
+// There are few more relaxed orderings:
+//
+// * Resetting the global head without adding new nodes. This is OK, because all the nodes are
+//   already „known“ to everyone by previous Release ordering and we don't care much if someone
+//   reads the old or new value of the head ‒ this is just optimisation to make sure the beginning
+//   doesn't get much more battering than the end and to distribute the ownership of nodes through
+//   the linked list.
+// * Failed compare_exchange orderings ‒ these don't have to synchronize anything, because they
+//   made no changes and the one that succeeds will make the relevant change.
+// * Loads of null pointers. But these don't need to synchronize any data.
 
 /// A short-term proxy object from [`peek`](struct.ArcSwap.html#method.peek)
 ///
@@ -329,6 +449,12 @@ impl<T> ArcSwap<T> {
     ///
     /// See details at [`AllocMode`](enum.AllocMode.html).
     pub fn peek_with_alloc(&self, alloc_mode: AllocMode) -> Guard<T> {
+        // We can do Relaxed here, the debt contains SeqCst one and will therefore load the other
+        // data properly. Well, with the exception the pointer is null, but then there's nothing to
+        // synchronize.
+        //
+        // TODO: Once we support nulls, put a SeqCst barrier here, because the debt will be skipped
+        // and we promised at least one SeqCst operation.
         let debt = Debt::confirmed(alloc_mode, || self.ptr.load(Ordering::Relaxed) as usize);
         let ptr = debt.ptr() as *const T;
 
@@ -417,6 +543,9 @@ impl<T> ArcSwap<T> {
         let mut debt_store = None;
 
         'outer: loop {
+            // In case we succeed, we want SeqCst to act like a swap.
+            // In the failed case, Relaxed is enough. We'll allocate a debt and that one will tho
+            // the SeqCst for us, so we can save one here.
             let previous = self.ptr.compare_and_swap(current, new, Ordering::SeqCst);
             let swapped = current == previous;
 
@@ -428,6 +557,8 @@ impl<T> ArcSwap<T> {
                     debt_store.unwrap_or_else(|| Debt::new(previous as usize, alloc_mode));
                 let mut previous = previous;
                 loop {
+                    // This works the same as Relaxed in load, it relies on the SeqCst in the Debt
+                    // allocation.
                     let confirm = self.ptr.load(Ordering::Relaxed);
                     if confirm == previous {
                         Self::dispose(new);

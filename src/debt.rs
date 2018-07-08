@@ -572,6 +572,7 @@ mod tests {
             assert!(!debt_1.active);
             // We can't really do this, other test might have used that slot already!
             // assert_eq!(debt_1.slot.load(Ordering::Relaxed), EMPTY_SLOT);
+            assert_ne!(debt_1.slot.load(Ordering::Relaxed), TEST_PTR_1);
 
             assert!(!debt_2.pay());
             assert!(debt_3.pay());

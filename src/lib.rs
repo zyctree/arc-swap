@@ -90,8 +90,6 @@
 //! }
 //! ```
 //!
-//! It is possible another thread loads 0 from the `a2` and 1 from `a1` (in this order).
-//!
 //! # RCU
 //!
 //! This also offers an [RCU implementation](struct.ArcSwap.html#method.rcu), for read-heavy
@@ -188,9 +186,10 @@ use debt::Debt;
 // To work around this, we introduce a system of debts. If a pointer is owed a reference, it is
 // stored into a global list. We load the pointer, store the debt and recheck the pointer is still
 // valid. If it is, we know it is safe to operate on it, because it is kept alive. The load itself
-// can pay the debt or the swap operation can ‒ it pays all the debts before giving the pointer to
-// the caller. In this system, the total number of debts + strong count is equal or greater (and it
-// is equal when all the debts are dealt with) to the real number of owners.
+// can pay the debt or the swap operation can (load pays its own, swap can pay for others) ‒ swap
+// pays all the debts before giving the pointer to the caller. In this system, the total number of
+// debts + strong count is equal or greater (and it is equal when all the debts are dealt with) to
+// the real number of owners.
 //
 // The strong count never drops to 0 as long as the pointer is inside, so it can't be destroyed.
 // When it leaves (through swap), all the debts are paid and turned into strong counts (sometimes
@@ -400,9 +399,10 @@ impl<T> ArcSwap<T> {
     /// If the debt was already paid by someone else, the reference is not increased.
     fn load_bump(ptr: *const T, mut debt: Debt) -> Arc<T> {
         let arc = unsafe { Arc::from_raw(ptr) };
-        // Bump the reference count by one, so we can return one into the arc and another to
-        // the caller.
+        // Bump the reference count by one to cover the newly created Arc.
         if debt.active() {
+            // We need to first increment it and then pay the debt. But that can have false
+            // positive (paying it twice), so we need to compensate if that happens.
             Arc::into_raw(Arc::clone(&arc));
             if !debt.pay() {
                 Self::dispose(ptr);
@@ -437,7 +437,9 @@ impl<T> ArcSwap<T> {
     ///
     /// The performance of both reads and writes decrease with the (global) number of guards alive.
     /// Therefore, this is more suitable to have a one-time look into the data than storing in some
-    /// data structures. Prefer [`load`](#method.load) for that and store the actual `Arc`.
+    /// data structures or doing extensive queries into the data. Prefer [`load`](#method.load) for
+    /// that and store the actual `Arc` (which is *slightly* more expensive to get, but has no
+    /// penalty to store).
     ///
     /// This method is *not* safe inside signal handlers. Use
     /// [`peek_with_alloc`](#method.peek_with_alloc) for that.
@@ -447,7 +449,8 @@ impl<T> ArcSwap<T> {
 
     /// Loans the value for a short time, with specified allocation mode.
     ///
-    /// See details at [`AllocMode`](enum.AllocMode.html).
+    /// This acts like [`peek`](#method.peek.html), but allows specifying the [allocation
+    /// mode](enum.AllocMode.html). The main usage is to allow using it inside signal handlers.
     pub fn peek_with_alloc(&self, alloc_mode: AllocMode) -> Guard<T> {
         // We can do Relaxed here, the debt contains SeqCst one and will therefore load the other
         // data properly. Well, with the exception the pointer is null, but then there's nothing to
@@ -482,8 +485,12 @@ impl<T> ArcSwap<T> {
         let inc = || {
             Arc::into_raw(Arc::clone(&old_arc));
         };
-        inc(); // Precharge
+        // Pre-charge (the pay_all pays after claiming a debt, which is wrong ‒ we need to pay
+        // upfront to stay safe.
+        inc();
         Debt::pay_all(old_ptr, inc);
+        // We create a new Arc here. The `old_arc` will be dropped on the exit of the function,
+        // returning back the pre-charge.
         unsafe { Arc::from_raw(old) }
     }
 
@@ -493,7 +500,8 @@ impl<T> ArcSwap<T> {
         // AcqRel needed to publish the target of the new pointer and get the target of the old
         // one.
         //
-        // SeqCst to synchronize the time lines with the group counters.
+        // SeqCst to synchronize the time lines with the debts ‒ this takes a „snapshot“ (we'll see
+        // debt no older than when this change happens).
         let old = self.ptr.swap(new, Ordering::SeqCst);
         Self::extract(old)
     }
@@ -536,20 +544,27 @@ impl<T> ArcSwap<T> {
         new: Arc<T>,
         alloc_mode: AllocMode,
     ) -> Arc<T> {
-        // As noted above, this method has either semantics of load or of store. We don't know
-        // which ones upfront, so we need to implement safety measures for both.
         let current = current.as_raw() as *mut _;
         let new = strip(new);
-        let mut debt_store = None;
+        // We may want to share the debt between iterations...
+        let mut debt_store: Option<Debt> = None;
 
         'outer: loop {
             // In case we succeed, we want SeqCst to act like a swap.
-            // In the failed case, Relaxed is enough. We'll allocate a debt and that one will tho
-            // the SeqCst for us, so we can save one here.
             let previous = self.ptr.compare_and_swap(current, new, Ordering::SeqCst);
             let swapped = current == previous;
 
             if swapped {
+                if let Some(mut debt) = debt_store {
+                    // A debt was left from previous iteration.
+                    // We didn't actually need the debt, so get rid of it.
+                    // (this is a rare corner case ‒ the first CAS failed, but the second succeeded
+                    // in replacing).
+                    if !debt.pay() {
+                        // Someone already paid the debt… that nobody needed :-|
+                        Self::dispose(debt.ptr() as *const _);
+                    }
+                }
                 // New went into us, so leave it at that
                 return Self::extract(previous);
             } else {
@@ -564,11 +579,15 @@ impl<T> ArcSwap<T> {
                         Self::dispose(new);
                         return Self::load_bump(previous, debt);
                     } else if confirm == current {
+                        // There's a chance the next attempt at CAS would succeed, retry the whole
+                        // thing. But keep the debt around.
                         debt_store = Some(debt);
                         continue 'outer;
                     } else if debt.replace(confirm as usize) {
+                        // We have a new pointer to confirm, retry.
                         previous = confirm;
                     } else {
+                        // The debt was paid before we saw the new one, so we are safe using it.
                         Self::dispose(new);
                         return Self::load_bump(previous, debt);
                     }
@@ -580,11 +599,11 @@ impl<T> ArcSwap<T> {
     /// Read-Copy-Update of the pointer inside.
     ///
     /// This is useful in read-heavy situations with several threads that sometimes update the data
-    /// pointed to. The readers can just repeatedly use [`load`](#method.load) without any locking.
-    /// The writer uses this method to perform the update.
+    /// pointed to. The readers can just repeatedly use the [`peek`](#method.peek) without any
+    /// locking. The writer uses this method to perform the update.
     ///
     /// In case there's only one thread that does updates or in case the next version is
-    /// independent of the previous onse, simple [`swap`](#method.swap) or [`store`](#method.store)
+    /// independent of the previous one, simple [`swap`](#method.swap) or [`store`](#method.store)
     /// is enough. Otherwise, it may be needed to retry the update operation if some other thread
     /// made an update in between. This is what this method does.
     ///
@@ -612,9 +631,10 @@ impl<T> ArcSwap<T> {
     ///         for _ in 0..10 {
     ///             scope.spawn(|| {
     ///                 let inner = cnt.load();
+    ///                 let updated = *inner + 1;
     ///                 // Another thread might have stored some other number than what we have
     ///                 // between the load and store.
-    ///                 cnt.store(Arc::new(*inner + 1));
+    ///                 cnt.store(Arc::new(updated));
     ///             });
     ///         }
     ///     });
@@ -726,7 +746,7 @@ impl<T> ArcSwap<T> {
     /// the arc and unwraps it.
     ///
     /// One use case is around signal handlers. The signal handler loads the pointer, but it must
-    /// not be the last one to drop it. Therefore, this methods make sure there are no signal
+    /// not be the last one to drop it. Therefore, this method makes sure there are no signal
     /// handlers owning it at the time of deconstruction of the `Arc`.
     ///
     /// Another use case might be an RCU with a structure that is rather slow to drop ‒ if it was

@@ -1,3 +1,8 @@
+* Both `swap` and `load` (and similar methods) are now lock-free (but not
+  wait-free). Currently, a backend very similar to hazard pointers is used.
+* Signal safety needs to be explicitly requested (as there's worse performance
+  and only limited lock-freeness in that case).
+
 # 0.1.4
 
 * The `peek` method to use the `Arc` inside without incrementing the reference

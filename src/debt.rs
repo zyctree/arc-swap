@@ -280,7 +280,7 @@ fn get_head(alloc_mode: AllocMode) -> &'static Node {
 /// A representation of one debt.
 ///
 /// The debt may be already paid for.
-pub(crate) struct Debt {
+pub struct Debt {
     ptr: usize,
     slot: &'static AtomicUsize,
     active: bool,

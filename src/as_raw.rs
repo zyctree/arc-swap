@@ -22,11 +22,13 @@ impl<T> AsRaw<T> for Arc<T> {
     }
 }
 
+/*
 impl<T> AsRaw<T> for Guard<T> {
     fn as_raw(&self) -> *const T {
         &self as &T as *const T
     }
 }
+*/
 
 #[cfg(test)]
 mod tests {

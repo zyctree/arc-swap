@@ -1,5 +1,5 @@
 #![doc(html_root_url = "https://docs.rs/arc-swap/0.1.4/arc-swap/", test(attr(deny(warnings))))]
-#![deny(missing_docs)]
+// #![deny(missing_docs)] XXX
 
 //! Making [`Arc`] itself atomic
 //!
@@ -157,10 +157,12 @@
 pub mod as_raw;
 
 mod debt;
+mod ref_cnt;
 
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -169,6 +171,7 @@ pub use debt::AllocMode;
 
 use as_raw::AsRaw;
 use debt::Debt;
+use ref_cnt::RefCnt;
 
 // # Inner working
 //
@@ -252,13 +255,13 @@ use debt::Debt;
 /// Note that the `Guard` can outlive the `ArcSwap` it comes from. This is by design. Same as it is
 /// possible to exchange the content of the `ArcSwap` with a `Guard` alive, it is possible to drop
 /// the `ArcSwap` ‒ the `Arc` itself is kept alive as long as at least one `Guard` holds it.
-pub struct Guard<T> {
+pub struct Guard<T: RefCnt> {
     debt: Debt,
-    ptr: *const T,
-    _arc: PhantomData<Arc<T>>,
+    ptr: *const T::Base,
+    _arc: PhantomData<T>,
 }
 
-impl<T> Guard<T> {
+impl<T: RefCnt> Guard<T> {
     /// Upgrades the guard to a real `Arc`.
     ///
     /// This shares the reference count with all the `Arc` inside the corresponding `ArcSwap`. Use
@@ -283,31 +286,26 @@ impl<T> Guard<T> {
     /// }
     /// # let _ = ptr;
     /// ```
-    pub fn upgrade(guard: &Self) -> Arc<T> {
-        let arc = unsafe { Arc::from_raw(guard.ptr) };
-        Arc::into_raw(Arc::clone(&arc));
-        arc
+    pub fn upgrade(guard: &Self) -> T {
+        let res = T::from_nonnull(guard.ptr);
+        T::inc(&res);
+        res
     }
 }
 
-impl<T> Deref for Guard<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
+impl<T: RefCnt> Deref for Guard<T> {
+    type Target = T::Base;
+    fn deref(&self) -> &T::Base {
         unsafe { self.ptr.as_ref().unwrap() }
     }
 }
 
-impl<T> Drop for Guard<T> {
+impl<T: RefCnt> Drop for Guard<T> {
     fn drop(&mut self) {
         if !self.debt.pay() {
-            ArcSwap::<T>::dispose(self.ptr);
+            T::dispose(self.ptr);
         }
     }
-}
-
-/// Turn the arc into a raw pointer.
-fn strip<T>(arc: Arc<T>) -> *mut T {
-    Arc::into_raw(arc) as *mut T
 }
 
 /// An atomic storage for [`Arc`].
@@ -337,22 +335,24 @@ fn strip<T>(arc: Arc<T>) -> *mut T {
 ///
 /// [`Arc`]: https://doc.rust-lang.org/std/sync/struct.Arc.html
 /// [`from`]: https://doc.rust-lang.org/nightly/std/convert/trait.From.html#tymethod.from
-pub struct ArcSwap<T> {
+pub type ArcSwap<T> = ArcSwapAny<Arc<T>>;
+
+pub struct ArcSwapAny<T: RefCnt> {
     // Notes: AtomicPtr needs Sized
     /// The actual pointer, extracted from the Arc.
-    ptr: AtomicPtr<T>,
+    ptr: AtomicPtr<T::Base>,
 
     /// We are basically an Arc in disguise. Inherit parameters from Arc by pretending to contain
     /// it.
-    _phantom_arc: PhantomData<Arc<T>>,
+    _phantom_arc: PhantomData<T>,
 }
 
-impl<T> From<Arc<T>> for ArcSwap<T> {
-    fn from(arc: Arc<T>) -> Self {
+impl<T: RefCnt> From<T> for ArcSwapAny<T> {
+    fn from(val: T) -> Self {
         // The AtomicPtr requires *mut in its interface. We are more like *const, so we cast it.
         // However, we always go back to *const right away when we get the pointer on the other
         // side, so it should be fine.
-        let ptr = strip(arc);
+        let ptr = T::strip(val);
         Self {
             ptr: AtomicPtr::new(ptr),
             _phantom_arc: PhantomData,
@@ -360,7 +360,7 @@ impl<T> From<Arc<T>> for ArcSwap<T> {
     }
 }
 
-impl<T> Drop for ArcSwap<T> {
+impl<T: RefCnt> Drop for ArcSwapAny<T> {
     fn drop(&mut self) {
         let ptr = *self.ptr.get_mut();
         // Note: the extract associated function pays all the debts on this. We are doing drop, so
@@ -370,45 +370,45 @@ impl<T> Drop for ArcSwap<T> {
     }
 }
 
-impl<T> Clone for ArcSwap<T> {
+impl<T: RefCnt> Clone for ArcSwapAny<T> {
     fn clone(&self) -> Self {
         Self::from(self.load())
     }
 }
 
-impl<T: Debug> Debug for ArcSwap<T> {
+impl<T: Debug + RefCnt> Debug for ArcSwapAny<T> {
     fn fmt(&self, formatter: &mut Formatter) -> FmtResult {
         self.load().fmt(formatter)
     }
 }
 
-impl<T: Display> Display for ArcSwap<T> {
+impl<T: Display + RefCnt> Display for ArcSwapAny<T> {
     fn fmt(&self, formatter: &mut Formatter) -> FmtResult {
         self.load().fmt(formatter)
     }
 }
 
-impl<T> ArcSwap<T> {
-    /// Removes one reference from this pointer (or, the Arc belonging to this pointer).
-    fn dispose(ptr: *const T) {
-        drop(unsafe { Arc::from_raw(ptr) });
-    }
-
+impl<T: RefCnt> ArcSwapAny<T> {
     /// Increases the reference on the pointer and turns it into an Arc.
     ///
     /// If the debt was already paid by someone else, the reference is not increased.
-    fn load_bump(ptr: *const T, mut debt: Debt) -> Arc<T> {
-        let arc = unsafe { Arc::from_raw(ptr) };
-        // Bump the reference count by one to cover the newly created Arc.
-        if debt.active() {
-            // We need to first increment it and then pay the debt. But that can have false
-            // positive (paying it twice), so we need to compensate if that happens.
-            Arc::into_raw(Arc::clone(&arc));
-            if !debt.pay() {
-                Self::dispose(ptr);
+    fn load_bump(ptr: *const T::Base, mut debt: Debt) -> T {
+        if ptr.is_null() {
+            debug_assert!(!debt.active());
+            T::from_null()
+        } else {
+            let res = T::from_nonnull(ptr);
+            // Bump the reference count by one to cover the newly created Arc.
+            if debt.active() {
+                // We need to first increment it and then pay the debt. But that can have false
+                // positive (paying it twice), so we need to compensate if that happens.
+                T::inc(&res);
+                if !debt.pay() {
+                    T::dispose(ptr);
+                }
             }
+            res
         }
-        arc
     }
 
     /// Loads the value.
@@ -420,8 +420,8 @@ impl<T> ArcSwap<T> {
     ///
     /// This method is *not* safe inside signal handlers. Use
     /// [`peek_with_alloc`](#method.peek_with_alloc) for that.
-    pub fn load(&self) -> Arc<T> {
-        Guard::upgrade(&self.peek())
+    pub fn load(&self) -> T {
+        T::guard_upgrade(&self.peek())
     }
 
     /// Loans the value for a short time.
@@ -443,7 +443,7 @@ impl<T> ArcSwap<T> {
     ///
     /// This method is *not* safe inside signal handlers. Use
     /// [`peek_with_alloc`](#method.peek_with_alloc) for that.
-    pub fn peek(&self) -> Guard<T> {
+    pub fn peek(&self) -> T::Guard {
         self.peek_with_alloc(AllocMode::Allowed)
     }
 
@@ -451,7 +451,7 @@ impl<T> ArcSwap<T> {
     ///
     /// This acts like [`peek`](#method.peek.html), but allows specifying the [allocation
     /// mode](enum.AllocMode.html). The main usage is to allow using it inside signal handlers.
-    pub fn peek_with_alloc(&self, alloc_mode: AllocMode) -> Guard<T> {
+    pub fn peek_with_alloc(&self, alloc_mode: AllocMode) -> T::Guard {
         // We can do Relaxed here, the debt contains SeqCst one and will therefore load the other
         // data properly. Well, with the exception the pointer is null, but then there's nothing to
         // synchronize.
@@ -459,31 +459,26 @@ impl<T> ArcSwap<T> {
         // TODO: Once we support nulls, put a SeqCst barrier here, because the debt will be skipped
         // and we promised at least one SeqCst operation.
         let debt = Debt::confirmed(alloc_mode, || self.ptr.load(Ordering::Relaxed) as usize);
-        let ptr = debt.ptr() as *const T;
 
-        Guard {
-            debt,
-            ptr,
-            _arc: PhantomData,
-        }
+        T::guard_from_debt(debt)
     }
 
     /// Replaces the value inside this instance.
     ///
     /// Further loads will yield the new value. Uses [`swap`](#method.swap) internally.
-    pub fn store(&self, arc: Arc<T>) {
-        drop(self.swap(arc));
+    pub fn store(&self, val: T) {
+        drop(self.swap(val));
     }
 
     /// Takes the raw pointer, pays all the debt related to it and turns it into an `Arc`.
     ///
     /// This is a helper function for things like `swap`, when the inner pointer is being
     /// extracted and leaves the `ArcSwap`.
-    fn extract(old: *const T) -> Arc<T> {
+    fn extract(old: *const T::Base) -> T {
         let old_ptr = old as usize;
-        let old_arc = unsafe { Arc::from_raw(old) };
+        let old_arc = T::from_nonnull(old);
         let inc = || {
-            Arc::into_raw(Arc::clone(&old_arc));
+            T::inc(&old_arc);
         };
         // Pre-charge (the pay_all pays after claiming a debt, which is wrong ‒ we need to pay
         // upfront to stay safe.
@@ -491,19 +486,23 @@ impl<T> ArcSwap<T> {
         Debt::pay_all(old_ptr, inc);
         // We create a new Arc here. The `old_arc` will be dropped on the exit of the function,
         // returning back the pre-charge.
-        unsafe { Arc::from_raw(old) }
+        T::from_nonnull(old)
     }
 
     /// Exchanges the value inside this instance.
-    pub fn swap(&self, arc: Arc<T>) -> Arc<T> {
-        let new = strip(arc);
+    pub fn swap(&self, val: T) -> T {
+        let new = T::strip(val);
         // AcqRel needed to publish the target of the new pointer and get the target of the old
         // one.
         //
         // SeqCst to synchronize the time lines with the debts ‒ this takes a „snapshot“ (we'll see
         // debt no older than when this change happens).
         let old = self.ptr.swap(new, Ordering::SeqCst);
-        Self::extract(old)
+        if old.is_null() {
+            T::from_null()
+        } else {
+            Self::extract(old)
+        }
     }
 
     /// Swaps the stored Arc if it is equal to `current`.
@@ -538,14 +537,14 @@ impl<T> ArcSwap<T> {
     /// assert!(Arc::ptr_eq(&arc, &orig));
     /// assert_eq!(0, *arc_swap.peek());
     /// ```
-    pub fn compare_and_swap<C: AsRaw<T>>(
+    pub fn compare_and_swap( // TODO: AsRaw support
         &self,
-        current: &C,
-        new: Arc<T>,
+        current: &T,
+        new: T,
         alloc_mode: AllocMode,
-    ) -> Arc<T> {
-        let current = current.as_raw() as *mut _;
-        let new = strip(new);
+    ) -> T {
+        let current = T::as_raw(current);
+        let new = T::strip(new);
         // We may want to share the debt between iterations...
         let mut debt_store: Option<Debt> = None;
 
@@ -562,7 +561,7 @@ impl<T> ArcSwap<T> {
                     // in replacing).
                     if !debt.pay() {
                         // Someone already paid the debt… that nobody needed :-|
-                        Self::dispose(debt.ptr() as *const _);
+                        T::dispose(debt.ptr() as *const _);
                     }
                 }
                 // New went into us, so leave it at that
@@ -576,7 +575,7 @@ impl<T> ArcSwap<T> {
                     // allocation.
                     let confirm = self.ptr.load(Ordering::Relaxed);
                     if confirm == previous {
-                        Self::dispose(new);
+                        T::dispose(new);
                         return Self::load_bump(previous, debt);
                     } else if confirm == current {
                         // There's a chance the next attempt at CAS would succeed, retry the whole
@@ -588,7 +587,7 @@ impl<T> ArcSwap<T> {
                         previous = confirm;
                     } else {
                         // The debt was paid before we saw the new one, so we are safe using it.
-                        Self::dispose(new);
+                        T::dispose(new);
                         return Self::load_bump(previous, debt);
                     }
                 }
@@ -720,16 +719,16 @@ impl<T> ArcSwap<T> {
     /// shares most of the data with the old one. Something like
     /// [`rpds`](https://crates.io/crates/rpds) or [`im`](https://crates.io/crates/im) might do
     /// what you need.
-    pub fn rcu<R, F>(&self, mut f: F) -> Arc<T>
+    pub fn rcu<R, F>(&self, mut f: F) -> T
     where
-        F: FnMut(&Arc<T>) -> R,
-        R: Into<Arc<T>>,
+        F: FnMut(&T) -> R,
+        R: Into<T>,
     {
         let mut cur = self.load();
         loop {
             let new = f(&cur).into();
             let prev = self.compare_and_swap(&cur, new, AllocMode::Allowed);
-            let swapped = Arc::ptr_eq(&cur, &prev);
+            let swapped = ptr::eq(T::as_raw(&cur), T::as_raw(&prev));
             if swapped {
                 return prev;
             } else {
@@ -737,7 +736,9 @@ impl<T> ArcSwap<T> {
             }
         }
     }
+}
 
+impl<T> ArcSwap<T> {
     /// An [`rcu`](#method.rcu) which waits to be the sole owner of the original value and unwraps
     /// it.
     ///

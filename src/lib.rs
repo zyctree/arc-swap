@@ -287,7 +287,7 @@ impl<T: RefCnt> Guard<T> {
     /// # let _ = ptr;
     /// ```
     pub fn upgrade(guard: &Self) -> T {
-        let res = T::from_nonnull(guard.ptr);
+        let res = unsafe { T::from_ptr(guard.ptr) };
         T::inc(&res);
         res
     }
@@ -303,7 +303,7 @@ impl<T: RefCnt> Deref for Guard<T> {
 impl<T: RefCnt> Drop for Guard<T> {
     fn drop(&mut self) {
         if !self.debt.pay() {
-            T::dispose(self.ptr);
+            unsafe { T::dispose(self.ptr) };
         }
     }
 }
@@ -337,6 +337,8 @@ impl<T: RefCnt> Drop for Guard<T> {
 /// [`from`]: https://doc.rust-lang.org/nightly/std/convert/trait.From.html#tymethod.from
 pub type ArcSwap<T> = ArcSwapAny<Arc<T>>;
 
+pub type ArcSwapOption<T> = ArcSwapAny<Option<Arc<T>>>;
+
 pub struct ArcSwapAny<T: RefCnt> {
     // Notes: AtomicPtr needs Sized
     /// The actual pointer, extracted from the Arc.
@@ -349,9 +351,6 @@ pub struct ArcSwapAny<T: RefCnt> {
 
 impl<T: RefCnt> From<T> for ArcSwapAny<T> {
     fn from(val: T) -> Self {
-        // The AtomicPtr requires *mut in its interface. We are more like *const, so we cast it.
-        // However, we always go back to *const right away when we get the pointer on the other
-        // side, so it should be fine.
         let ptr = T::strip(val);
         Self {
             ptr: AtomicPtr::new(ptr),
@@ -393,22 +392,17 @@ impl<T: RefCnt> ArcSwapAny<T> {
     ///
     /// If the debt was already paid by someone else, the reference is not increased.
     fn load_bump(ptr: *const T::Base, mut debt: Debt) -> T {
-        if ptr.is_null() {
-            debug_assert!(!debt.active());
-            T::from_null()
-        } else {
-            let res = T::from_nonnull(ptr);
-            // Bump the reference count by one to cover the newly created Arc.
-            if debt.active() {
-                // We need to first increment it and then pay the debt. But that can have false
-                // positive (paying it twice), so we need to compensate if that happens.
-                T::inc(&res);
-                if !debt.pay() {
-                    T::dispose(ptr);
-                }
+        let res = unsafe { T::from_ptr(ptr) };
+        // Bump the reference count by one to cover the newly created Arc.
+        if debt.active() {
+            // We need to first increment it and then pay the debt. But that can have false
+            // positive (paying it twice), so we need to compensate if that happens.
+            T::inc(&res);
+            if !debt.pay() {
+                unsafe { T::dispose(ptr) };
             }
-            res
         }
+        res
     }
 
     /// Loads the value.
@@ -476,7 +470,7 @@ impl<T: RefCnt> ArcSwapAny<T> {
     /// extracted and leaves the `ArcSwap`.
     fn extract(old: *const T::Base) -> T {
         let old_ptr = old as usize;
-        let old_arc = T::from_nonnull(old);
+        let old_arc = unsafe { T::from_ptr(old) };
         let inc = || {
             T::inc(&old_arc);
         };
@@ -486,7 +480,7 @@ impl<T: RefCnt> ArcSwapAny<T> {
         Debt::pay_all(old_ptr, inc);
         // We create a new Arc here. The `old_arc` will be dropped on the exit of the function,
         // returning back the pre-charge.
-        T::from_nonnull(old)
+        unsafe { T::from_ptr(old) }
     }
 
     /// Exchanges the value inside this instance.
@@ -498,11 +492,7 @@ impl<T: RefCnt> ArcSwapAny<T> {
         // SeqCst to synchronize the time lines with the debts ‒ this takes a „snapshot“ (we'll see
         // debt no older than when this change happens).
         let old = self.ptr.swap(new, Ordering::SeqCst);
-        if old.is_null() {
-            T::from_null()
-        } else {
-            Self::extract(old)
-        }
+        Self::extract(old)
     }
 
     /// Swaps the stored Arc if it is equal to `current`.
@@ -561,7 +551,7 @@ impl<T: RefCnt> ArcSwapAny<T> {
                     // in replacing).
                     if !debt.pay() {
                         // Someone already paid the debt… that nobody needed :-|
-                        T::dispose(debt.ptr() as *const _);
+                        unsafe { T::dispose(debt.ptr() as *const _) };
                     }
                 }
                 // New went into us, so leave it at that
@@ -575,7 +565,7 @@ impl<T: RefCnt> ArcSwapAny<T> {
                     // allocation.
                     let confirm = self.ptr.load(Ordering::Relaxed);
                     if confirm == previous {
-                        T::dispose(new);
+                        unsafe { T::dispose(new) };
                         return Self::load_bump(previous, debt);
                     } else if confirm == current {
                         // There's a chance the next attempt at CAS would succeed, retry the whole
@@ -587,7 +577,7 @@ impl<T: RefCnt> ArcSwapAny<T> {
                         previous = confirm;
                     } else {
                         // The debt was paid before we saw the new one, so we are safe using it.
-                        T::dispose(new);
+                        unsafe { T::dispose(new) };
                         return Self::load_bump(previous, debt);
                     }
                 }

@@ -537,13 +537,13 @@ impl<T: RefCnt> ArcSwapAny<T> {
     /// assert!(Arc::ptr_eq(&arc, &orig));
     /// assert_eq!(0, *arc_swap.peek());
     /// ```
-    pub fn compare_and_swap( // TODO: AsRaw support
+    pub fn compare_and_swap<C: AsRaw<T::Base>>(
         &self,
-        current: &T,
+        current: &C,
         new: T,
         alloc_mode: AllocMode,
     ) -> T {
-        let current = T::as_raw(current);
+        let current = C::as_raw(current) as *mut _;
         let new = T::strip(new);
         // We may want to share the debt between iterations...
         let mut debt_store: Option<Debt> = None;

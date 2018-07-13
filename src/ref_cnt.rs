@@ -1,8 +1,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use super::Guard;
-use super::debt::Debt;
+use super::{Debt, Guard};
 
 pub unsafe trait RefCnt {
     type Base;

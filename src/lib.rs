@@ -414,6 +414,7 @@ impl<'a, S: LockStorage> GenLock<'a, S> {
             SignalSafety::Unsafe => lock_storage.choose_shard(),
         };
         let gen = lock_storage.gen_idx().load(Ordering::Relaxed) % GEN_CNT;
+        // FIXME; This is outdated and no longer true.
         // Unlike the real Arc, we don't have to check for the ref count overflow. Nobody can drop
         // a reader.
         //

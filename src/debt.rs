@@ -174,13 +174,17 @@ impl Debt {
                     let i = (i + offset) % len;
                     // Note: the indexing check is almost certainly optimised out because the len
                     // is used above. And using .get_unchecked was actually *slower*.
-                    let got_it = node.slots.0[i]
+                    let val = node.slots.0[i]
                         .0
                         // Try to acquire the slot. Relaxed if it doesn't work is fine, as we don't
                         // synchronize by it.
-                        .compare_exchange(NO_DEBT, ptr, Ordering::SeqCst, Ordering::Relaxed)
-                        .is_ok();
-                    if got_it {
+                        //
+                        // FIXME: These orderings are likely *wrong*. This is experimenting with
+                        // stuff. Do not merge and prove what is needed. Just trying out the speeds
+                        // now.
+                        .load(Ordering::Acquire);
+                    if val == NO_DEBT {
+                        node.slots.0[i].0.store(ptr, Ordering::Release);
                         head.offset.set(i + 1);
                         return Some(&node.slots.0[i]);
                     }
@@ -225,7 +229,7 @@ impl Debt {
             for slot in &node.slots.0 {
                 if slot
                     .0
-                    .compare_exchange(ptr as usize, NO_DEBT, Ordering::AcqRel, Ordering::Relaxed)
+                    .compare_exchange(ptr as usize, NO_DEBT, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
                     T::inc(&val);

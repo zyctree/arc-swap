@@ -100,16 +100,15 @@
 //! use std::sync::Arc;
 //!
 //! use arc_swap::ArcSwap;
-//! use crossbeam_utils::thread;
 //!
 //! let config = ArcSwap::from(Arc::new(String::default()));
-//! thread::scope(|scope| {
-//!     scope.spawn(|_| {
+//! std::thread::scope(|scope| {
+//!     scope.spawn(|| {
 //!         let new_conf = Arc::new("New configuration".to_owned());
 //!         config.store(new_conf);
 //!     });
 //!     for _ in 0..10 {
-//!         scope.spawn(|_| {
+//!         scope.spawn(|| {
 //!             loop {
 //!                 let cfg = config.load();
 //!                 if !cfg.is_empty() {
@@ -119,7 +118,7 @@
 //!             }
 //!         });
 //!     }
-//! }).unwrap();
+//! });
 //! ```
 //!
 //! [RwLock]: https://doc.rust-lang.org/std/sync/struct.RwLock.html
